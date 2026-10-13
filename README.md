@@ -136,6 +136,7 @@ requests, and the server already bounds how many searches run at once.
 | `src/slskd.rs` | Serde types for the slskd API. |
 | `src/states.rs` | slskd transfer states to download states. |
 | `src/tokens.rs` | The opaque token codecs. |
+| `src/url.rs` | URL validation, joining and encoding. |
 | `src/version.rs` | slskd version parsing and the 0.26.0 requirement. |
 | `manifest.json` | The plugin manifest the server reads. |
 
