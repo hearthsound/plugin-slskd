@@ -39,7 +39,8 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use hearthsound_plugin::acquisition_provider::exports::hearthsound::plugin::acquisition::{
-    Capabilities, DownloadState, Granularity, Guest as AcquisitionGuest, Query, SearchState,
+    Capabilities, DownloadState, Granularity, Guest as AcquisitionGuest, OutputFile, Progress,
+    Query, SearchState,
 };
 use hearthsound_plugin::acquisition_provider::exports::hearthsound::plugin::lifecycle::Guest as LifecycleGuest;
 use hearthsound_plugin::host;
@@ -53,6 +54,7 @@ pub mod download;
 pub mod random;
 pub mod search;
 pub mod slskd;
+pub mod states;
 pub mod tokens;
 pub mod url;
 pub mod version;
@@ -327,10 +329,74 @@ impl AcquisitionGuest for Slskd {
         })
     }
 
-    fn poll_download(_download_token: String) -> Result<DownloadState, ProviderError> {
-        Err(ProviderError::Internal(
-            "monitoring downloads is not implemented yet".to_string(),
-        ))
+    fn poll_download(download_token: String) -> Result<DownloadState, ProviderError> {
+        let config = configured()?;
+        let token: tokens::DownloadToken = tokens::decode(&download_token)?;
+        let client = client(&config);
+
+        let expected: Vec<tokens::ExpectedFile> = token
+            .batches
+            .iter()
+            .flat_map(|batch| batch.files.iter().cloned())
+            .collect();
+
+        let mut observed = Vec::new();
+        let mut transfers = Vec::new();
+
+        for batch in &token.batches {
+            match client.get_json::<slskd::Batch>(&batch_path(&batch.id)) {
+                Ok(batch) => {
+                    transfers.extend(batch.transfers.iter().map(|transfer| transfer.id.clone()));
+                    observed.extend(batch.transfers.iter().map(states::Observed::from));
+                }
+                // A batch slskd no longer knows leaves its files unaccounted
+                // for, which the assessment reports as unverifiable.
+                Err(ProviderError::NotFound) => {
+                    hearthsound_plugin::warn!("slskd no longer knows batch {}", batch.id);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        match states::assess(&expected, &observed) {
+            states::Assessment::Failed(message) => {
+                hearthsound_plugin::warn!("download {} failed: {message}", token.key);
+
+                Ok(DownloadState::Failed(message))
+            }
+            states::Assessment::Queued(place) => Ok(DownloadState::Queued(place)),
+            states::Assessment::Running(progress) => {
+                Ok(DownloadState::Running(wit_progress(progress)))
+            }
+            states::Assessment::AwaitingFiles(progress) => {
+                if !files_present(&config, &token.key, &expected) {
+                    // slskd signals a completed transfer before it moves the
+                    // file out of its incomplete directory, so the file is
+                    // only believed once it is at its pinned path.
+                    return Ok(DownloadState::Running(wit_progress(progress)));
+                }
+
+                complete(&client, &token, &transfers);
+
+                Ok(DownloadState::Complete(output_files(
+                    &config, &token.key, &expected,
+                )))
+            }
+            states::Assessment::Unverifiable => {
+                if !files_present(&config, &token.key, &expected) {
+                    // The download cannot be judged and its files are not
+                    // there: the server treats this as a lost download and
+                    // restarts the search.
+                    return Err(ProviderError::NotFound);
+                }
+
+                complete(&client, &token, &transfers);
+
+                Ok(DownloadState::Complete(output_files(
+                    &config, &token.key, &expected,
+                )))
+            }
+        }
     }
 
     fn cancel_download(download_token: String) {
@@ -347,9 +413,12 @@ impl AcquisitionGuest for Slskd {
         let client = client(&config);
 
         for batch in &token.batches {
-            for transfer in transfers(&client, &batch.id) {
-                clear_transfer(&client, &token.username, &transfer.id);
-            }
+            let ids: Vec<String> = transfers(&client, &batch.id)
+                .into_iter()
+                .map(|transfer| transfer.id)
+                .collect();
+
+            clear_transfers(&client, &token.username, &ids);
         }
     }
 }
@@ -531,6 +600,112 @@ fn clear_transfer(client: &api::Client, username: &str, id: &str) {
             hearthsound_plugin::warn!("could not clear slskd transfer {id}: HTTP {status}")
         }
         Err(error) => hearthsound_plugin::warn!("could not clear slskd transfer {id}: {error:?}"),
+    }
+}
+
+/// Reports a finished download and clears its transfers from slskd.
+///
+/// slskd keeps every transfer record it is not told to forget, so the plugin
+/// clears the ones it reported. `remove=true` is a record-only delete: the file
+/// itself is left where slskd put it for the server to import.
+///
+/// # Parameters
+///
+/// - `client`: the instance's client.
+/// - `token`: the download's token.
+/// - `transfers`: ids of the transfers to clear.
+fn complete(client: &api::Client, token: &tokens::DownloadToken, transfers: &[String]) {
+    hearthsound_plugin::info!(
+        "download {} from {} produced {} file(s)",
+        token.key,
+        token.username,
+        token
+            .batches
+            .iter()
+            .map(|batch| batch.files.len())
+            .sum::<usize>()
+    );
+
+    clear_transfers(client, &token.username, transfers);
+}
+
+/// Clears the given transfers from slskd's records, ignoring failures.
+///
+/// # Parameters
+///
+/// - `client`: the instance's client.
+/// - `username`: the peer the transfers belong to.
+/// - `ids`: ids of the transfers.
+fn clear_transfers(client: &api::Client, username: &str, ids: &[String]) {
+    for id in ids {
+        clear_transfer(client, username, id);
+    }
+}
+
+/// Returns whether every expected file is present at its pinned path.
+///
+/// # Parameters
+///
+/// - `config`: the instance configuration, which names the import root.
+/// - `key`: the download's key, which names the destination directory.
+/// - `expected`: the files the download is expected to produce.
+///
+/// # Returns
+///
+/// `true` when every file is a regular file of exactly the expected size. A
+/// file that is still being written, renamed or missing makes this `false`.
+fn files_present(config: &config::Config, key: &str, expected: &[tokens::ExpectedFile]) -> bool {
+    expected.iter().all(|file| {
+        let path = download::pinned_path(key, &file.name);
+
+        match host::files::stat(&config.import_root, &path) {
+            Some(stat) => !stat.is_dir && stat.size == file.size,
+            None => false,
+        }
+    })
+}
+
+/// Builds the output files of a completed download.
+///
+/// # Parameters
+///
+/// - `config`: the instance configuration, which names the import root.
+/// - `key`: the download's key.
+/// - `expected`: the files the download produced.
+///
+/// # Returns
+///
+/// One output file per expected file, naming the import root and the pinned
+/// path.
+fn output_files(
+    config: &config::Config,
+    key: &str,
+    expected: &[tokens::ExpectedFile],
+) -> Vec<OutputFile> {
+    expected
+        .iter()
+        .map(|file| OutputFile {
+            root: config.import_root.clone(),
+            path: download::pinned_path(key, &file.name),
+            track_index: None,
+        })
+        .collect()
+}
+
+/// Converts the plugin's progress into the interface's record.
+///
+/// # Parameters
+///
+/// - `progress`: the summed progress of a download.
+///
+/// # Returns
+///
+/// The progress record `poll-download` reports.
+fn wit_progress(progress: states::Progress) -> Progress {
+    Progress {
+        bytes: progress.bytes,
+        total_bytes: Some(progress.total_bytes),
+        speed_bps: Some(progress.speed_bps),
     }
 }
 
@@ -843,6 +1018,36 @@ mod tests {
             enqueue_problem("peer", 500, b"boom"),
             ProviderError::Internal(message) if message.contains("HTTP 500") && message.contains("boom")
         ));
+    }
+
+    #[test]
+    fn reports_the_progress_record_the_interface_carries() {
+        let progress = wit_progress(states::Progress {
+            bytes: 10,
+            total_bytes: 100,
+            speed_bps: 5,
+        });
+
+        assert_eq!(progress.bytes, 10);
+        assert_eq!(progress.total_bytes, Some(100));
+        assert_eq!(progress.speed_bps, Some(5));
+    }
+
+    #[test]
+    fn pins_output_files_under_the_import_root() {
+        let config = config::Config::from_json(r#"{"importRoot":"slskd-downloads"}"#).unwrap();
+        let expected = vec![tokens::ExpectedFile {
+            filename: "@@tqkz\\Music\\01 Song.flac".to_string(),
+            name: "01 Song.flac".to_string(),
+            size: 4_841,
+        }];
+
+        let files = output_files(&config, "0f8b", &expected);
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].root, "slskd-downloads");
+        assert_eq!(files[0].path, "hearthsound/0f8b/01 Song.flac");
+        assert_eq!(files[0].track_index, None);
     }
 
     #[test]

@@ -1,0 +1,25 @@
+{
+  "createdAt": "2026-10-13T17:04:02.1130000Z",
+  "direction": "Download",
+  "id": "4c1f0b7a-4e2d-4c5f-8a6b-0d1e2f3a4b5c",
+  "options": {
+    "destination": "hearthsound/0f8b"
+  },
+  "transfers": [
+    {
+      "averageSpeed": 0,
+      "batchId": "4c1f0b7a-4e2d-4c5f-8a6b-0d1e2f3a4b5c",
+      "bytesTransferred": 0,
+      "direction": "Download",
+      "enqueuedAt": "2026-10-13T17:04:02.5000000Z",
+      "filename": "@@tqkz\\Music\\01 Windowlicker.flac",
+      "id": "9b2f5c1a-7d3e-4a8b-9c0d-1e2f3a4b5c6d",
+      "placeInQueue": 4,
+      "requestedAt": "2026-10-13T17:04:02.1130000Z",
+      "size": 48410233,
+      "state": "Queued, Remotely",
+      "username": "peer_free"
+    }
+  ],
+  "username": "peer_free"
+}

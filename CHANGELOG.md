@@ -21,3 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Candidate download through the slskd batch API: the download key, the batch
   per remote directory with a pinned destination, the download token, and the
   record-only cleanup of a cancelled transfer.
+- Download monitoring: the transfer state mapping, the queue and progress
+  reports, the pinned-path check that keeps a download running until every file
+  is on disk, the not-found that tells the server to restart a lost download,
+  and the record-only cleanup of finished transfers.
