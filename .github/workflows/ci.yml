@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: Build, check and pack
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Lint the plugin
+        run: cargo clippy --target wasm32-wasip2 -- -D warnings
+      - name: Lint the host tests
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+      - name: Build the plugin
+        run: cargo build --release --locked --target wasm32-wasip2
+      - name: Install hsplugin
+        run: cargo install --locked --git https://github.com/hearthsound/plugin-sdk --tag v0.1.1 hearthsound-plugin-cli
+      - name: Check the plugin
+        run: hsplugin check
+      - name: Pack the plugin
+        run: hsplugin pack --out-dir dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: app.hearthsound.slskd.hsplugin
+          path: dist/*.hsplugin

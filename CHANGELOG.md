@@ -25,3 +25,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports, the pinned-path check that keeps a download running until every file
   is on disk, the not-found that tells the server to restart a lost download,
   and the record-only cleanup of finished transfers.
+- A CI workflow that formats, lints, tests, builds, checks and packs the
+  plugin, and uploads the archive.
