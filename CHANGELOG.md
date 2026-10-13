@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-13
+
 ### Added
 
 - The repository scaffolding: the toolchain pin, the dual MIT/Apache-2.0 license
@@ -27,3 +29,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the record-only cleanup of finished transfers.
 - A CI workflow that formats, lints, tests, builds, checks and packs the
   plugin, and uploads the archive.
+
+[Unreleased]: https://github.com/hearthsound/plugin-slskd/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/hearthsound/plugin-slskd/releases/tag/v0.1.0
