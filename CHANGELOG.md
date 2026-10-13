@@ -18,3 +18,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   responses to candidates with its queue, extension and lock filters, the
   candidate tokens, and the store entry that carries a search between polls,
   plus the manifest that declares the plugin.
+- Candidate download through the slskd batch API: the download key, the batch
+  per remote directory with a pinned destination, the download token, and the
+  record-only cleanup of a cancelled transfer.

@@ -54,6 +54,42 @@ pub struct RemoteFile {
     pub size: u64,
 }
 
+/// The token `start-download` returns.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadToken {
+    /// The download's random key, which names the destination directory its
+    /// files land in.
+    pub key: String,
+    /// Name of the peer the files come from.
+    pub username: String,
+    /// Batches the files were enqueued in.
+    pub batches: Vec<BatchRef>,
+}
+
+/// One batch of a download.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchRef {
+    /// Id of the slskd batch.
+    pub id: String,
+    /// Files the batch is expected to produce.
+    pub files: Vec<ExpectedFile>,
+}
+
+/// One file a download is expected to produce.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExpectedFile {
+    /// Remote path, exactly as the peer reported it, which is what slskd's
+    /// transfer records carry.
+    pub filename: String,
+    /// Name the file lands under, which is its remote file name.
+    pub name: String,
+    /// Expected size in bytes.
+    pub size: u64,
+}
+
 /// Encodes a token payload.
 ///
 /// # Parameters
@@ -169,6 +205,37 @@ mod tests {
             decode::<CandidateToken>(&encode(&token).unwrap()).unwrap(),
             token
         );
+    }
+
+    #[test]
+    fn round_trips_a_download_token() {
+        let token = DownloadToken {
+            key: "0f8b3c1d2e4a5b6c7d8e9f0a1b2c3d4e".to_string(),
+            username: "peer_free".to_string(),
+            batches: vec![BatchRef {
+                id: "4c1f0b7a-4e2d-4c5f-8a6b-0d1e2f3a4b5c".to_string(),
+                files: vec![ExpectedFile {
+                    filename: "@@tqkz\\Music\\01 Windowlicker.flac".to_string(),
+                    name: "01 Windowlicker.flac".to_string(),
+                    size: 48_410_233,
+                }],
+            }],
+        };
+
+        let encoded = encode(&token).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(&encoded).unwrap()).unwrap();
+
+        assert_eq!(json["key"], "0f8b3c1d2e4a5b6c7d8e9f0a1b2c3d4e");
+        assert_eq!(
+            json["batches"][0]["id"],
+            "4c1f0b7a-4e2d-4c5f-8a6b-0d1e2f3a4b5c"
+        );
+        assert_eq!(
+            json["batches"][0]["files"][0]["name"],
+            "01 Windowlicker.flac"
+        );
+        assert_eq!(decode::<DownloadToken>(&encoded).unwrap(), token);
     }
 
     #[test]

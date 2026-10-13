@@ -102,6 +102,37 @@ impl Client {
         path: &str,
         body: &B,
     ) -> Result<T, ProviderError> {
+        let response = self.post(path, body)?;
+        require_success(&response)?;
+
+        decode(&response)
+    }
+
+    /// Sends a POST request with a JSON body and returns the raw response.
+    ///
+    /// The batch enqueue needs the status and the body itself, because slskd
+    /// reports a partially enqueued batch with a success status and a list of
+    /// failures in the body.
+    ///
+    /// # Parameters
+    ///
+    /// - `path`: the API path.
+    /// - `body`: the value to send as the request body.
+    ///
+    /// # Returns
+    ///
+    /// The response, whatever its status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Internal`] when the body cannot be serialized
+    /// and [`ProviderError::Unavailable`] when the host cannot complete the
+    /// request.
+    pub(crate) fn post<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<Response, ProviderError> {
         let mut request = self.request("POST", path);
         request.body = Some(
             serde_json::to_vec(body)
@@ -111,7 +142,7 @@ impl Client {
             .headers
             .push(("content-type".to_string(), "application/json".to_string()));
 
-        self.send_json(&request)
+        self.send(&request)
     }
 
     /// Sends a request that carries no body and returns its status.
@@ -173,8 +204,7 @@ impl Client {
         let response = self.send(request)?;
         require_success(&response)?;
 
-        serde_json::from_slice(&response.body)
-            .map_err(|error| ProviderError::Internal(format!("response body: {error}")))
+        decode(&response)
     }
 
     /// Builds a request for one API path.
@@ -200,6 +230,24 @@ impl Client {
             timeout_ms: Some(REQUEST_TIMEOUT_MS),
         }
     }
+}
+
+/// Decodes a response body as JSON.
+///
+/// # Parameters
+///
+/// - `response`: the response whose body to decode.
+///
+/// # Returns
+///
+/// The decoded body.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::Internal`] when the body is not JSON for `T`.
+pub(crate) fn decode<T: DeserializeOwned>(response: &Response) -> Result<T, ProviderError> {
+    serde_json::from_slice(&response.body)
+        .map_err(|error| ProviderError::Internal(format!("response body: {error}")))
 }
 
 /// Requires a successful status, mapping the failure to a provider error.

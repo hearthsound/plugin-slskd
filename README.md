@@ -132,6 +132,7 @@ requests, and the server already bounds how many searches run at once.
 | `src/lib.rs` | The plugin: configuration, lifecycle and the acquisition interface. |
 | `src/api.rs` | The slskd HTTP transport and its error mapping. |
 | `src/config.rs` | The instance configuration and its schema-level checks. |
+| `src/download.rs` | Batch grouping, destinations and pinned paths. |
 | `src/search.rs` | Search-text widening and search responses to candidates. |
 | `src/slskd.rs` | Serde types for the slskd API. |
 | `src/states.rs` | slskd transfer states to download states. |

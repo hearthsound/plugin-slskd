@@ -43,11 +43,13 @@ use hearthsound_plugin::acquisition_provider::exports::hearthsound::plugin::acqu
 };
 use hearthsound_plugin::acquisition_provider::exports::hearthsound::plugin::lifecycle::Guest as LifecycleGuest;
 use hearthsound_plugin::host;
+use hearthsound_plugin::http;
 use hearthsound_plugin::kv;
 use hearthsound_plugin::types::ProviderError;
 
 mod api;
 pub mod config;
+pub mod download;
 pub mod random;
 pub mod search;
 pub mod slskd;
@@ -63,6 +65,9 @@ const SEARCH_KEY_PREFIX: &str = "search:";
 /// An hour is far longer than a search can take, and it bounds how long the
 /// progress of a search the server stopped polling occupies the store.
 const SEARCH_TTL_MS: u64 = 3_600_000;
+
+/// API path that enqueues a batch of downloads.
+const BATCH_PATH: &str = "/api/v0/transfers/downloads/batches";
 
 /// The plugin implementation.
 struct Slskd;
@@ -263,19 +268,90 @@ impl AcquisitionGuest for Slskd {
         clear_progress(&token.key);
     }
 
-    fn start_download(_candidate_token: String, _files: Vec<u32>) -> Result<String, ProviderError> {
-        Err(ProviderError::Internal(
-            "downloading candidates is not implemented yet".to_string(),
-        ))
+    fn start_download(candidate_token: String, files: Vec<u32>) -> Result<String, ProviderError> {
+        let config = configured()?;
+        let candidate: tokens::CandidateToken = tokens::decode(&candidate_token)?;
+        let selected = download::select(&candidate.files, &files)?;
+
+        if selected.is_empty() {
+            return Err(ProviderError::Internal(
+                "the candidate offers no file to download".to_string(),
+            ));
+        }
+
+        let key = random::key();
+        let destination = download::destination(&key);
+        let client = client(&config);
+        let mut batches = Vec::new();
+
+        // One batch per remote directory: slskd downloads a batch into one
+        // destination directory and flattens its files, so the files of a batch
+        // have to be the files of one remote directory.
+        for group in download::group_by_directory(&selected) {
+            let id = random::guid();
+            let request = slskd::EnqueueBatchRequest {
+                id: id.clone(),
+                username: candidate.username.clone(),
+                files: group
+                    .files
+                    .iter()
+                    .map(|file| slskd::BatchFile {
+                        filename: file.filename.clone(),
+                        size: file.size,
+                    })
+                    .collect(),
+                options: slskd::BatchOptions {
+                    destination: destination.clone(),
+                },
+            };
+
+            enqueue(&client, &candidate.username, &request)?;
+
+            batches.push(tokens::BatchRef {
+                id,
+                files: download::expected(&group.files),
+            });
+        }
+
+        hearthsound_plugin::info!(
+            "downloading {} file(s) from {} into {destination} in {} batch(es)",
+            selected.len(),
+            candidate.username,
+            batches.len()
+        );
+
+        tokens::encode(&tokens::DownloadToken {
+            key,
+            username: candidate.username,
+            batches,
+        })
     }
 
     fn poll_download(_download_token: String) -> Result<DownloadState, ProviderError> {
         Err(ProviderError::Internal(
-            "downloading candidates is not implemented yet".to_string(),
+            "monitoring downloads is not implemented yet".to_string(),
         ))
     }
 
-    fn cancel_download(_download_token: String) {}
+    fn cancel_download(download_token: String) {
+        let Ok(token) = tokens::decode::<tokens::DownloadToken>(&download_token) else {
+            hearthsound_plugin::warn!("cannot cancel a download from an unreadable token");
+
+            return;
+        };
+
+        let Ok(config) = configured() else {
+            return;
+        };
+
+        let client = client(&config);
+
+        for batch in &token.batches {
+            for transfer in transfers(&client, &batch.id) {
+                clear_transfer(&client, &token.username, &transfer.id);
+            }
+        }
+    }
 }
 
 hearthsound_plugin::export_acquisition_provider!(Slskd);
@@ -319,6 +395,156 @@ fn start_variant(
 
     progress.started(id);
     store_progress(key, progress)
+}
+
+/// Enqueues one batch of a download.
+///
+/// # Parameters
+///
+/// - `client`: the instance's client.
+/// - `username`: the peer the files come from.
+/// - `request`: the batch to enqueue.
+///
+/// # Errors
+///
+/// Returns the mapped error of a failed request, and
+/// [`ProviderError::Internal`] when slskd answered with a status the plugin
+/// cannot use or with failures for the files it enqueued.
+fn enqueue(
+    client: &api::Client,
+    username: &str,
+    request: &slskd::EnqueueBatchRequest,
+) -> Result<(), ProviderError> {
+    let response = client.post(BATCH_PATH, request)?;
+
+    if !http::is_success(&response) {
+        return Err(enqueue_problem(username, response.status, &response.body));
+    }
+
+    let enqueued: slskd::EnqueueBatchResponse = api::decode(&response)?;
+
+    if !enqueued.failures.is_empty() {
+        return Err(failures_problem(&enqueued.failures));
+    }
+
+    Ok(())
+}
+
+/// Maps a failed batch enqueue to the provider error the server sees.
+///
+/// # Parameters
+///
+/// - `username`: the peer the batch was for.
+/// - `status`: the status slskd answered with.
+/// - `body`: the response body, used as the message.
+///
+/// # Returns
+///
+/// Unauthorized for a rejected key, unavailable for a peer slskd reports as
+/// offline (`404`) and for a throttled request (`429`), and internal for every
+/// other status, which means the plugin sent something slskd would not accept.
+fn enqueue_problem(username: &str, status: u16, body: &[u8]) -> ProviderError {
+    let message = String::from_utf8_lossy(body);
+    let message = message.trim();
+
+    match status {
+        401 | 403 => ProviderError::Unauthorized(format!("slskd rejected the API key: {message}")),
+        404 => ProviderError::Unavailable(format!("slskd reports peer {username} as offline")),
+        429 => ProviderError::Unavailable("slskd is throttling transfers".to_string()),
+        _ => ProviderError::Internal(format!(
+            "slskd refused the batch for {username}: HTTP {status}: {message}"
+        )),
+    }
+}
+
+/// Renders the failures slskd reported for one batch.
+///
+/// # Parameters
+///
+/// - `failures`: the failures of the enqueue response.
+///
+/// # Returns
+///
+/// The provider error, naming the first few files and how many there are.
+fn failures_problem(failures: &[slskd::Failure]) -> ProviderError {
+    let mut details: Vec<String> = failures
+        .iter()
+        .take(3)
+        .map(|failure| format!("`{}`: {}", failure.filename, failure.message))
+        .collect();
+
+    if failures.len() > details.len() {
+        details.push(format!("and {} more", failures.len() - details.len()));
+    }
+
+    ProviderError::Internal(format!(
+        "slskd refused {} file(s): {}",
+        failures.len(),
+        details.join("; ")
+    ))
+}
+
+/// Reads the transfers of one batch.
+///
+/// # Parameters
+///
+/// - `client`: the instance's client.
+/// - `id`: id of the slskd batch.
+///
+/// # Returns
+///
+/// The transfers of the batch, and none when slskd does not know the batch or
+/// the request failed, which the callers of this function treat as "nothing to
+/// do".
+fn transfers(client: &api::Client, id: &str) -> Vec<slskd::Transfer> {
+    match client.get_json::<slskd::Batch>(&batch_path(id)) {
+        Ok(batch) => batch.transfers,
+        Err(error) => {
+            hearthsound_plugin::warn!("could not read slskd batch {id}: {error:?}");
+
+            Vec::new()
+        }
+    }
+}
+
+/// Clears one transfer from slskd's records.
+///
+/// `remove=true` is a record-only delete: slskd marks the transfer removed and
+/// leaves the file where it is, so a file the server has not imported yet is
+/// never touched.
+///
+/// # Parameters
+///
+/// - `client`: the instance's client.
+/// - `username`: the peer the transfer belongs to, which its route needs.
+/// - `id`: id of the transfer.
+fn clear_transfer(client: &api::Client, username: &str, id: &str) {
+    let path = format!(
+        "/api/v0/transfers/downloads/{}/{}?remove=true",
+        url::encode_segment(username),
+        id
+    );
+
+    match client.status("DELETE", &path) {
+        Ok(200 | 204 | 404) => {}
+        Ok(status) => {
+            hearthsound_plugin::warn!("could not clear slskd transfer {id}: HTTP {status}")
+        }
+        Err(error) => hearthsound_plugin::warn!("could not clear slskd transfer {id}: {error:?}"),
+    }
+}
+
+/// Returns the API path of one download batch.
+///
+/// # Parameters
+///
+/// - `id`: id of the slskd batch.
+///
+/// # Returns
+///
+/// The path, which carries no trailing slash because slskd's route does not.
+fn batch_path(id: &str) -> String {
+    format!("/api/v0/transfers/downloads/batches/{id}")
 }
 
 /// Cancels a running slskd search and lets go of its record.
@@ -588,5 +814,58 @@ mod tests {
     #[test]
     fn keys_search_progress_apart_from_other_entries() {
         assert_eq!(progress_key("abc"), "search:abc");
+    }
+
+    #[test]
+    fn names_the_batch_route_without_a_trailing_slash() {
+        assert_eq!(BATCH_PATH, "/api/v0/transfers/downloads/batches");
+        assert_eq!(
+            batch_path("4c1f0b7a"),
+            "/api/v0/transfers/downloads/batches/4c1f0b7a"
+        );
+    }
+
+    #[test]
+    fn maps_a_failed_enqueue_to_the_error_it_means() {
+        assert!(matches!(
+            enqueue_problem("peer", 401, b"no key"),
+            ProviderError::Unauthorized(_)
+        ));
+        assert!(matches!(
+            enqueue_problem("peer", 404, b""),
+            ProviderError::Unavailable(message) if message.contains("offline")
+        ));
+        assert!(matches!(
+            enqueue_problem("peer", 429, b""),
+            ProviderError::Unavailable(message) if message.contains("throttling")
+        ));
+        assert!(matches!(
+            enqueue_problem("peer", 500, b"boom"),
+            ProviderError::Internal(message) if message.contains("HTTP 500") && message.contains("boom")
+        ));
+    }
+
+    #[test]
+    fn renders_the_failures_of_an_enqueue() {
+        let failures = vec![
+            slskd::Failure {
+                filename: "a.mp3".to_string(),
+                message: "queue full".to_string(),
+            },
+            slskd::Failure {
+                filename: "b.mp3".to_string(),
+                message: "locked".to_string(),
+            },
+        ];
+
+        let error = failures_problem(&failures);
+
+        assert!(matches!(
+            error,
+            ProviderError::Internal(message)
+                if message.contains("2 file(s)")
+                    && message.contains("a.mp3")
+                    && message.contains("queue full")
+        ));
     }
 }
