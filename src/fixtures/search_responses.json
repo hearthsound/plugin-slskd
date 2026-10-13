@@ -1,0 +1,88 @@
+[
+  {
+    "fileCount": 2,
+    "files": [
+      {
+        "bitDepth": 16,
+        "bitRate": 1411,
+        "code": 1,
+        "extension": "flac",
+        "filename": "@@tqkz\\Music\\Aphex Twin\\Windowlicker (1999) [FLAC]\\01 Windowlicker.flac",
+        "isLocked": false,
+        "isVariableBitRate": false,
+        "length": 366,
+        "sampleRate": 44100,
+        "size": 48410233
+      },
+      {
+        "bitDepth": 16,
+        "bitRate": 1411,
+        "code": 1,
+        "extension": "flac",
+        "filename": "@@tqkz\\Music\\Aphex Twin\\Windowlicker (1999) [FLAC]\\02 Windowlicker (Demo).flac",
+        "isLocked": true,
+        "isVariableBitRate": false,
+        "length": 320,
+        "sampleRate": 44100,
+        "size": 41100000
+      }
+    ],
+    "hasFreeUploadSlot": true,
+    "lockedFileCount": 1,
+    "queueLength": 0,
+    "token": 11823,
+    "uploadSpeed": 812345,
+    "username": "peer_free"
+  },
+  {
+    "fileCount": 2,
+    "files": [
+      {
+        "bitRate": 320,
+        "code": 1,
+        "extension": "mp3",
+        "filename": "@@abcd\\shares\\music\\aphex twin - windowlicker.mp3",
+        "isLocked": false,
+        "isVariableBitRate": false,
+        "length": 366,
+        "sampleRate": 44100,
+        "size": 14680064
+      },
+      {
+        "code": 1,
+        "extension": "jpg",
+        "filename": "@@abcd\\shares\\music\\windowlicker\\cover.jpg",
+        "isLocked": false,
+        "size": 240123
+      }
+    ],
+    "hasFreeUploadSlot": false,
+    "lockedFileCount": 0,
+    "queueLength": 240,
+    "token": 11824,
+    "uploadSpeed": 400000,
+    "username": "peer_busy"
+  },
+  {
+    "fileCount": 1,
+    "files": [
+      {
+        "bitDepth": 24,
+        "bitRate": 2304,
+        "code": 1,
+        "extension": "flac",
+        "filename": "C:\\Users\\someone\\Music\\Aphex Twin\\Windowlicker\\01 Windowlicker.flac",
+        "isLocked": false,
+        "length": 366,
+        "sampleRate": 96000,
+        "size": 78000000
+      }
+    ],
+    "hasFreeUploadSlot": true,
+    "lockedFileCount": 0,
+    "queueLength": 1,
+    "token": 11825,
+    "uploadSpeed": 2000000,
+    "username": "peer_hires"
+  }
+]

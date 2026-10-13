@@ -1,0 +1,64 @@
+{
+  "manifestVersion": 1,
+  "id": "app.hearthsound.slskd",
+  "name": "slskd acquisition",
+  "version": "0.1.0",
+  "description": "Acquire tracks and albums from the Soulseek network through a slskd instance.",
+  "authors": ["Hearthsound contributors"],
+  "license": "MIT OR Apache-2.0",
+  "homepage": "https://github.com/hearthsound/plugin-slskd",
+  "api": "hearthsound:plugin@0.1.0",
+  "provides": ["acquisition"],
+  "permissions": {
+    "http": {
+      "hosts": ["$config:url"],
+      "maxBodyBytes": 10485760
+    },
+    "kv": { "maxBytes": 1048576 },
+    "files": { "importRoots": true },
+    "process": { "tools": [] }
+  },
+  "config": {
+    "server": {
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "required": ["url", "apiKey", "importRoot"],
+        "properties": {
+          "url": { "type": "string", "format": "uri", "title": "slskd base URL", "default": "http://slskd:5030" },
+          "apiKey": { "type": "string", "title": "slskd API key", "writeOnly": true },
+          "importRoot": { "type": "string", "title": "Import root id (slskd downloads directory)" },
+          "searchTimeoutMs": { "type": "integer", "title": "Search timeout (ms)", "default": 15000 },
+          "responseLimit": { "type": "integer", "title": "Response limit", "default": 100 },
+          "fileLimit": { "type": "integer", "title": "File limit", "default": 10000 },
+          "minUploadSpeedKbps": { "type": "integer", "title": "Minimum peer upload speed (kbps)", "default": 0 },
+          "maxPeerQueueLength": { "type": "integer", "title": "Maximum peer queue length", "default": 50 },
+          "preferredExtensions": {
+            "type": "array",
+            "items": { "type": "string" },
+            "title": "Preferred file extensions",
+            "default": ["flac", "mp3"]
+          }
+        }
+      },
+      "uiSchema": {
+        "type": "VerticalLayout",
+        "elements": [
+          { "type": "Control", "scope": "#/properties/url" },
+          { "type": "Control", "scope": "#/properties/apiKey" },
+          { "type": "Control", "scope": "#/properties/importRoot" },
+          { "type": "Group", "label": "Search", "elements": [
+            { "type": "Control", "scope": "#/properties/searchTimeoutMs" },
+            { "type": "Control", "scope": "#/properties/responseLimit" },
+            { "type": "Control", "scope": "#/properties/fileLimit" },
+            { "type": "Control", "scope": "#/properties/minUploadSpeedKbps" },
+            { "type": "Control", "scope": "#/properties/maxPeerQueueLength" },
+            { "type": "Control", "scope": "#/properties/preferredExtensions" }
+          ] }
+        ]
+      }
+    },
+    "user": null
+  },
+  "resources": { "memoryMb": 128, "callTimeoutMs": 30000, "maxInstances": 2 }
+}

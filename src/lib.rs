@@ -10,9 +10,17 @@
 //! The plugin needs slskd 0.26.0 or newer, because it downloads through the
 //! batch transfer API that release introduced, and it needs an API key.
 //!
-//! The pure logic sits in public modules ([`url`], [`version`], [`config`]); the
-//! binding-coupled glue that drives it - the HTTP transport and the acquisition
-//! operations - stays private.
+//! The pure logic sits in public modules ([`config`], [`random`], [`search`],
+//! [`slskd`], [`tokens`], [`url`], [`version`]); the binding-coupled glue that
+//! drives it - the HTTP transport and the acquisition operations - stays
+//! private.
+//!
+//! # State between calls
+//!
+//! A plugin instance is recycled after every call, so the widening progress of
+//! a search is kept in the instance's host-kv store under a key the search
+//! token names. Candidate and download tokens carry their own state, because
+//! they are small and the server may hold them across restarts.
 //!
 //! # Tests
 //!
@@ -30,13 +38,34 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+use hearthsound_plugin::acquisition_provider::exports::hearthsound::plugin::acquisition::{
+    Capabilities, DownloadState, Granularity, Guest as AcquisitionGuest, Query, SearchState,
+};
+use hearthsound_plugin::acquisition_provider::exports::hearthsound::plugin::lifecycle::Guest as LifecycleGuest;
 use hearthsound_plugin::host;
+use hearthsound_plugin::kv;
 use hearthsound_plugin::types::ProviderError;
 
 mod api;
 pub mod config;
+pub mod random;
+pub mod search;
+pub mod slskd;
+pub mod tokens;
 pub mod url;
 pub mod version;
+
+/// Prefix of the host-kv keys that hold the progress of one search.
+const SEARCH_KEY_PREFIX: &str = "search:";
+
+/// How long a search's progress stays readable, in milliseconds.
+///
+/// An hour is far longer than a search can take, and it bounds how long the
+/// progress of a search the server stopped polling occupies the store.
+const SEARCH_TTL_MS: u64 = 3_600_000;
+
+/// The plugin implementation.
+struct Slskd;
 
 /// Validates a server-scoped configuration document.
 ///
@@ -101,6 +130,304 @@ pub fn health() -> Result<String, ProviderError> {
         ))),
         Probe::Failed(error) => Err(error),
     }
+}
+
+/// Implements the lifecycle interface.
+impl LifecycleGuest for Slskd {
+    fn validate_config(server_config: String) -> Result<(), Vec<String>> {
+        validate_config(&server_config)
+    }
+
+    fn health() -> Result<String, ProviderError> {
+        health()
+    }
+}
+
+/// Implements the acquisition interface.
+impl AcquisitionGuest for Slskd {
+    fn get_capabilities() -> Capabilities {
+        Capabilities {
+            granularities: vec![Granularity::Track],
+            progressive: false,
+        }
+    }
+
+    fn start_search(query: Query) -> Result<String, ProviderError> {
+        let config = configured()?;
+
+        if query.granularity != Granularity::Track {
+            return Err(ProviderError::Internal(
+                "this plugin acquires tracks only".to_string(),
+            ));
+        }
+
+        let wanted = query.tracks.first().ok_or_else(|| {
+            ProviderError::Internal("the query carries no wanted track".to_string())
+        })?;
+        let artist = wanted.artists.first().map_or("", String::as_str);
+        let plan = search::plan(&wanted.title, artist);
+
+        if plan.is_empty() {
+            return Err(ProviderError::Internal(
+                "the wanted track has no usable title".to_string(),
+            ));
+        }
+
+        let key = random::key();
+        let token = tokens::encode(&tokens::SearchToken { key: key.clone() })?;
+        let mut progress = search::Progress::new(plan);
+        let variant = progress.variant().cloned();
+
+        hearthsound_plugin::info!(
+            "searching slskd for `{}` in {} variants",
+            wanted.title,
+            progress.plan.len()
+        );
+
+        if let Some(variant) = variant {
+            start_variant(&client(&config), &config, &key, &mut progress, &variant)?;
+        }
+
+        Ok(token)
+    }
+
+    fn poll_search(search_token: String) -> Result<SearchState, ProviderError> {
+        let config = configured()?;
+        let token: tokens::SearchToken = tokens::decode(&search_token)?;
+        let client = client(&config);
+        let mut progress = load_progress(&token.key)?;
+
+        let Some(variant) = progress.variant().cloned() else {
+            return Ok(SearchState::Complete(Vec::new()));
+        };
+
+        let Some(search_id) = progress.search_id.clone() else {
+            start_variant(&client, &config, &token.key, &mut progress, &variant)?;
+
+            return Ok(SearchState::Running(Vec::new()));
+        };
+
+        let search: slskd::Search = client.get_json(&format!("/api/v0/searches/{search_id}"))?;
+        if !search.is_complete {
+            return Ok(SearchState::Running(Vec::new()));
+        }
+
+        let responses: Vec<slskd::SearchResponse> =
+            client.get_json(&format!("/api/v0/searches/{search_id}/responses"))?;
+        let filter = search::Filter::from_config(&config);
+        let found = search::candidates(
+            &search_id,
+            &responses,
+            &filter,
+            variant.require_artist.as_deref(),
+        )?;
+
+        hearthsound_plugin::info!(
+            "slskd search {search_id} (`{}`) returned {} responses and {} candidates",
+            variant.text,
+            responses.len(),
+            found.len()
+        );
+
+        // The progress is written before the search is deleted, so a failure in
+        // between leaves a search to clean up rather than a progress that
+        // points at a search slskd no longer has.
+        let next = progress.advance(!found.is_empty()).cloned();
+        store_progress(&token.key, &progress)?;
+        clear_search(&client, &search_id);
+
+        match next {
+            Some(next) => {
+                start_variant(&client, &config, &token.key, &mut progress, &next)?;
+
+                Ok(SearchState::Running(Vec::new()))
+            }
+            None => Ok(SearchState::Complete(found)),
+        }
+    }
+
+    fn cancel_search(search_token: String) {
+        let Ok(token) = tokens::decode::<tokens::SearchToken>(&search_token) else {
+            hearthsound_plugin::warn!("cannot cancel a search from an unreadable token");
+
+            return;
+        };
+
+        if let Ok(progress) = load_progress(&token.key)
+            && let Ok(config) = configured()
+            && let Some(search_id) = progress.search_id
+        {
+            cancel_request(&client(&config), &search_id);
+        }
+
+        clear_progress(&token.key);
+    }
+
+    fn start_download(_candidate_token: String, _files: Vec<u32>) -> Result<String, ProviderError> {
+        Err(ProviderError::Internal(
+            "downloading candidates is not implemented yet".to_string(),
+        ))
+    }
+
+    fn poll_download(_download_token: String) -> Result<DownloadState, ProviderError> {
+        Err(ProviderError::Internal(
+            "downloading candidates is not implemented yet".to_string(),
+        ))
+    }
+
+    fn cancel_download(_download_token: String) {}
+}
+
+hearthsound_plugin::export_acquisition_provider!(Slskd);
+
+/// Starts the slskd search for one variant and records it in the progress.
+///
+/// # Parameters
+///
+/// - `client`: the instance's client.
+/// - `config`: the instance configuration, which supplies the search limits.
+/// - `key`: the search token's key, under which the progress is stored.
+/// - `progress`: the search's progress, updated with the new search id.
+/// - `variant`: the variant to search for.
+///
+/// # Errors
+///
+/// Returns the mapped error of a failed request, and
+/// [`ProviderError::Internal`] when the progress cannot be stored.
+fn start_variant(
+    client: &api::Client,
+    config: &config::Config,
+    key: &str,
+    progress: &mut search::Progress,
+    variant: &search::Variant,
+) -> Result<(), ProviderError> {
+    let id = random::guid();
+    let request = slskd::SearchRequest {
+        id: id.clone(),
+        search_text: variant.text.clone(),
+        search_timeout: config.search_timeout_ms,
+        response_limit: config.response_limit,
+        file_limit: config.file_limit,
+        filter_responses: true,
+        minimum_peer_upload_speed: config.min_upload_speed_bps(),
+        maximum_peer_queue_length: config.max_peer_queue_length,
+    };
+
+    let _: slskd::Search = client.post_json("/api/v0/searches", &request)?;
+
+    hearthsound_plugin::debug!("started slskd search {id} for `{}`", variant.text);
+
+    progress.started(id);
+    store_progress(key, progress)
+}
+
+/// Cancels a running slskd search and lets go of its record.
+///
+/// slskd keeps every search it is not told to forget, so the plugin both
+/// cancels the search (which stops it) and deletes it (which removes the row).
+/// A failure is logged and ignored: the search is over from the plugin's point
+/// of view either way.
+///
+/// # Parameters
+///
+/// - `client`: the instance's client.
+/// - `id`: id of the slskd search.
+fn cancel_request(client: &api::Client, id: &str) {
+    match client.status("PUT", &format!("/api/v0/searches/{id}")) {
+        Ok(200 | 204 | 404) => {}
+        Ok(status) => {
+            hearthsound_plugin::warn!("could not cancel slskd search {id}: HTTP {status}")
+        }
+        Err(error) => hearthsound_plugin::warn!("could not cancel slskd search {id}: {error:?}"),
+    }
+
+    clear_search(client, id);
+}
+
+/// Deletes a finished slskd search, logging and ignoring a failure.
+///
+/// # Parameters
+///
+/// - `client`: the instance's client.
+/// - `id`: id of the slskd search.
+fn clear_search(client: &api::Client, id: &str) {
+    match client.status("DELETE", &format!("/api/v0/searches/{id}")) {
+        Ok(200 | 204 | 404) => {}
+        Ok(status) => {
+            hearthsound_plugin::warn!("could not delete slskd search {id}: HTTP {status}")
+        }
+        Err(error) => hearthsound_plugin::warn!("could not delete slskd search {id}: {error:?}"),
+    }
+}
+
+/// Reads the progress of one search from the instance's store.
+///
+/// # Parameters
+///
+/// - `key`: the search token's key.
+///
+/// # Returns
+///
+/// The progress of that search.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::NotFound`] when the store has no live entry for the
+/// key, which means the search token is unknown to this instance or has
+/// expired.
+fn load_progress(key: &str) -> Result<search::Progress, ProviderError> {
+    kv::get_json(&progress_key(key))?.ok_or(ProviderError::NotFound)
+}
+
+/// Writes the progress of one search to the instance's store.
+///
+/// # Parameters
+///
+/// - `key`: the search token's key.
+/// - `progress`: the progress to store.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::Internal`] when the value cannot be serialized or
+/// the host rejects the write.
+fn store_progress(key: &str, progress: &search::Progress) -> Result<(), ProviderError> {
+    kv::set_json(&progress_key(key), progress, Some(SEARCH_TTL_MS))
+}
+
+/// Removes the progress of one search from the instance's store.
+///
+/// # Parameters
+///
+/// - `key`: the search token's key.
+fn clear_progress(key: &str) {
+    host::kv::delete(&progress_key(key));
+}
+
+/// Returns the host-kv key that holds one search's progress.
+///
+/// # Parameters
+///
+/// - `key`: the search token's key.
+///
+/// # Returns
+///
+/// The store key, prefixed so a search's entry cannot collide with an entry
+/// another part of the plugin writes.
+fn progress_key(key: &str) -> String {
+    format!("{SEARCH_KEY_PREFIX}{key}")
+}
+
+/// Builds the slskd client of one instance.
+///
+/// # Parameters
+///
+/// - `config`: the instance configuration.
+///
+/// # Returns
+///
+/// A client for the configured URL and key.
+fn client(config: &config::Config) -> api::Client {
+    api::Client::new(&config.base_url(), &config.api_key)
 }
 
 /// The outcome of a version probe against one configured instance.
@@ -248,5 +575,18 @@ mod tests {
 
         assert!(message.contains("0.25.1"), "{message}");
         assert!(message.contains(version::MINIMUM_SUPPORTED), "{message}");
+    }
+
+    #[test]
+    fn advertises_track_granularity_only() {
+        let capabilities = Slskd::get_capabilities();
+
+        assert_eq!(capabilities.granularities, vec![Granularity::Track]);
+        assert!(!capabilities.progressive);
+    }
+
+    #[test]
+    fn keys_search_progress_apart_from_other_entries() {
+        assert_eq!(progress_key("abc"), "search:abc");
     }
 }

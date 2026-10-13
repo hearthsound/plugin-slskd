@@ -79,6 +79,15 @@ impl Config {
     pub fn base_url(&self) -> String {
         url::normalize_base_url(&self.url)
     }
+
+    /// Returns the minimum peer upload speed in bytes per second.
+    ///
+    /// slskd reports peer speeds in bytes per second while the setting is
+    /// configured in kilobits per second, so the value is scaled by 125 (one
+    /// kilobit per second is 125 bytes per second).
+    pub fn min_upload_speed_bps(&self) -> u32 {
+        self.min_upload_speed_kbps.saturating_mul(125)
+    }
 }
 
 /// Returns the default base URL of the slskd instance.
@@ -306,6 +315,20 @@ mod tests {
         assert_eq!(config.min_upload_speed_kbps, 80);
         assert_eq!(config.max_peer_queue_length, 5);
         assert_eq!(config.preferred_extensions, vec!["flac"]);
+    }
+
+    #[test]
+    fn scales_the_minimum_upload_speed_to_bytes() {
+        let config = Config::from_json(r#"{"minUploadSpeedKbps":80}"#).unwrap();
+
+        assert_eq!(config.min_upload_speed_bps(), 10_000);
+        assert_eq!(Config::from_json("{}").unwrap().min_upload_speed_bps(), 0);
+        assert_eq!(
+            Config::from_json(r#"{"minUploadSpeedKbps":4294967295}"#)
+                .unwrap()
+                .min_upload_speed_bps(),
+            u32::MAX
+        );
     }
 
     #[test]

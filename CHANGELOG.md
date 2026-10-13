@@ -14,3 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration validation and the health probe: the manifest's configuration
   defaults, the schema-level checks, and a live slskd version check that refuses
   an instance older than 0.26.0.
+- Track search over slskd: the widening query plan, the mapping from search
+  responses to candidates with its queue, extension and lock filters, the
+  candidate tokens, and the store entry that carries a search between polls,
+  plus the manifest that declares the plugin.
