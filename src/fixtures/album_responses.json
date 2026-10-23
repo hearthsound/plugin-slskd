@@ -1,0 +1,69 @@
+[
+  {
+    "fileCount": 4,
+    "files": [
+      {
+        "bitDepth": 16,
+        "bitRate": 900,
+        "extension": "flac",
+        "filename": "@@one\\Music\\Radiohead\\OK Computer [FLAC]\\01 Airbag.flac",
+        "isLocked": false,
+        "length": 284,
+        "sampleRate": 44100,
+        "size": 1000
+      },
+      {
+        "bitDepth": 16,
+        "bitRate": 900,
+        "extension": "flac",
+        "filename": "@@one\\Music\\Radiohead\\OK Computer [FLAC]\\02 Paranoid Android.flac",
+        "isLocked": false,
+        "length": 387,
+        "sampleRate": 44100,
+        "size": 2000
+      },
+      {
+        "extension": "jpg",
+        "filename": "@@one\\Music\\Radiohead\\OK Computer [FLAC]\\cover.jpg",
+        "isLocked": false,
+        "size": 50
+      },
+      {
+        "extension": "flac",
+        "filename": "@@one\\Music\\Various\\Mixtape\\03 Creep.flac",
+        "isLocked": false,
+        "length": 239,
+        "size": 3000
+      }
+    ],
+    "hasFreeUploadSlot": true,
+    "lockedFileCount": 0,
+    "queueLength": 0,
+    "uploadSpeed": 812345,
+    "username": "peer_one"
+  },
+  {
+    "fileCount": 2,
+    "files": [
+      {
+        "extension": "flac",
+        "filename": "@@two\\shares\\Radiohead\\OK Computer\\01 Airbag.flac",
+        "isLocked": false,
+        "length": 284,
+        "size": 1100
+      },
+      {
+        "extension": "flac",
+        "filename": "@@two\\shares\\Radiohead\\OK Computer\\02 Paranoid Android.flac",
+        "isLocked": true,
+        "length": 387,
+        "size": 2100
+      }
+    ],
+    "hasFreeUploadSlot": false,
+    "lockedFileCount": 1,
+    "queueLength": 2,
+    "uploadSpeed": 400000,
+    "username": "peer_two"
+  }
+]

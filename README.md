@@ -3,11 +3,17 @@
 A [Hearthsound](https://github.com/hearthsound) acquisition plugin that finds and
 downloads files from the Soulseek network through a
 [slskd](https://github.com/slskd/slskd) instance. It compiles to a WebAssembly
-component implementing the `acquisition` provider interface at track
-granularity: the server hands the plugin a wanted track, the plugin searches
-slskd for candidate files, enqueues the selected candidate through the slskd
-batch download API, and reports the files it produced once they are on disk in
-the instance's import root.
+component implementing the `acquisition` provider interface at track and album
+granularity: the server hands the plugin a wanted track, or a wanted album with
+its tracks, the plugin searches slskd for candidate files, enqueues the selected
+candidate through the slskd batch download API, and reports the files it
+produced once they are on disk in the instance's import root.
+
+A track query answers with one candidate per audio file. An album query answers
+with one candidate per peer folder, holding every audio file of that folder and
+no track indices: an album lives in one directory, so the server maps the
+folder's files to the album's tracks and the whole album downloads from one peer
+in one batch.
 
 The plugin only talks to slskd: slskd owns the Soulseek connection, the peer
 download queue and the download directory, and the plugin reads its HTTP API.
@@ -104,6 +110,15 @@ requests, and the server already bounds how many searches run at once.
   bare title and keep the responses whose path names the artist. Soulseek only
   matches peers whose file path contains every query term, which is why the
   plugin keeps punctuation, collapses only whitespace, and widens in that order.
+- An album query widens the same way around the album: `<album-artist> <album>`,
+  then that text with the bracketed parts of the album removed, then the bare
+  album keeping only the files whose path names the album artist. A step runs
+  only when the step before it produced no candidate.
+- An album candidate is a peer folder: its title is the folder's name, its path
+  is the remote directory and its files are every audio file of that folder,
+  without a `track-index`. The server decides which file is which track, and
+  because all files of a folder share one directory they are enqueued in one
+  batch.
 - Each candidate carries a token holding the peer name and the exact remote
   files, so a candidate survives the server recycling a plugin instance.
 - `start-download` enqueues one batch per remote directory with
@@ -133,7 +148,7 @@ requests, and the server already bounds how many searches run at once.
 | `src/api.rs` | The slskd HTTP transport and its error mapping. |
 | `src/config.rs` | The instance configuration and its schema-level checks. |
 | `src/download.rs` | Batch grouping, destinations and pinned paths. |
-| `src/search.rs` | Search-text widening and search responses to candidates. |
+| `src/search.rs` | Search-text widening and search responses to track and album candidates. |
 | `src/slskd.rs` | Serde types for the slskd API. |
 | `src/states.rs` | slskd transfer states to download states. |
 | `src/tokens.rs` | The opaque token codecs. |

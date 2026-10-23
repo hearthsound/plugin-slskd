@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Album search and acquisition: the plugin advertises the `album` granularity,
+  searches for `<album-artist> <album>` and its fallbacks, and answers with one
+  candidate per peer folder holding every audio file of that folder, so a whole
+  album downloads from one peer directory in one batch.
+
 ### Changed
 
 - The plugin targets plugin API `hearthsound:plugin@0.3.0` and builds against

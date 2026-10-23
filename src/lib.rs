@@ -5,7 +5,9 @@
 //! owns the Soulseek connection, the peer upload queue and the download
 //! directory. It implements `lifecycle` (configuration validation and a health
 //! probe) and `acquisition` (search, candidate download and download
-//! monitoring), and nothing else.
+//! monitoring) at track and album granularity, and nothing else. An album query
+//! answers with one candidate per peer folder, holding the folder's audio
+//! files, so a whole album is downloaded from one peer directory.
 //!
 //! The plugin needs slskd 0.26.0 or newer, because it downloads through the
 //! batch transfer API that release introduced, and it needs an API key.
@@ -154,7 +156,7 @@ impl LifecycleGuest for Slskd {
 impl AcquisitionGuest for Slskd {
     fn get_capabilities() -> Capabilities {
         Capabilities {
-            granularities: vec![Granularity::Track],
+            granularities: vec![Granularity::Track, Granularity::Album],
             progressive: false,
         }
     }
@@ -162,32 +164,48 @@ impl AcquisitionGuest for Slskd {
     fn start_search(query: Query) -> Result<String, ProviderError> {
         let config = configured()?;
 
-        if query.granularity != Granularity::Track {
-            return Err(ProviderError::Internal(
-                "this plugin acquires tracks only".to_string(),
-            ));
-        }
+        let (kind, subject, plan) = match query.granularity {
+            Granularity::Track => {
+                let wanted = query.tracks.first().ok_or_else(|| {
+                    ProviderError::Internal("the query carries no wanted track".to_string())
+                })?;
+                let artist = wanted.artists.first().map_or("", String::as_str);
 
-        let wanted = query.tracks.first().ok_or_else(|| {
-            ProviderError::Internal("the query carries no wanted track".to_string())
-        })?;
-        let artist = wanted.artists.first().map_or("", String::as_str);
-        let plan = search::plan(&wanted.title, artist);
+                (
+                    search::Kind::Track,
+                    wanted.title.clone(),
+                    search::plan(&wanted.title, artist),
+                )
+            }
+            Granularity::Album => {
+                let album = query.album.as_deref().unwrap_or_default();
+                let album_artist = query.album_artist.as_deref().unwrap_or_default();
+
+                (
+                    search::Kind::Album,
+                    album.to_string(),
+                    search::album_plan(album, album_artist),
+                )
+            }
+        };
 
         if plan.is_empty() {
-            return Err(ProviderError::Internal(
-                "the wanted track has no usable title".to_string(),
-            ));
+            let problem = match kind {
+                search::Kind::Track => "the wanted track has no usable title",
+                search::Kind::Album => "the wanted album has no usable title",
+            };
+
+            return Err(ProviderError::Internal(problem.to_string()));
         }
 
         let key = random::key();
         let token = tokens::encode(&tokens::SearchToken { key: key.clone() })?;
-        let mut progress = search::Progress::new(plan);
+        let mut progress = search::Progress::new(plan, kind);
         let variant = progress.variant().cloned();
 
         hearthsound_plugin::info!(
             "searching slskd for `{}` in {} variants",
-            wanted.title,
+            subject,
             progress.plan.len()
         );
 
@@ -222,12 +240,20 @@ impl AcquisitionGuest for Slskd {
         let responses: Vec<slskd::SearchResponse> =
             client.get_json(&format!("/api/v0/searches/{search_id}/responses"))?;
         let filter = search::Filter::from_config(&config);
-        let found = search::candidates(
-            &search_id,
-            &responses,
-            &filter,
-            variant.require_artist.as_deref(),
-        )?;
+        let found = match progress.kind {
+            search::Kind::Track => search::candidates(
+                &search_id,
+                &responses,
+                &filter,
+                variant.require_artist.as_deref(),
+            )?,
+            search::Kind::Album => search::album_candidates(
+                &search_id,
+                &responses,
+                &filter,
+                variant.require_artist.as_deref(),
+            )?,
+        };
 
         hearthsound_plugin::info!(
             "slskd search {search_id} (`{}`) returned {} responses and {} candidates",
@@ -979,10 +1005,13 @@ mod tests {
     }
 
     #[test]
-    fn advertises_track_granularity_only() {
+    fn advertises_track_and_album_granularity() {
         let capabilities = Slskd::get_capabilities();
 
-        assert_eq!(capabilities.granularities, vec![Granularity::Track]);
+        assert_eq!(
+            capabilities.granularities,
+            vec![Granularity::Track, Granularity::Album]
+        );
         assert!(!capabilities.progressive);
     }
 

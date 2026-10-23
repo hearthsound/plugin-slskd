@@ -16,6 +16,12 @@
 //! Soulseek, widening is a cost, and a step that found something does not need
 //! the next one.
 //!
+//! An album query widens the same way, with the album artist and the album in
+//! place of the track: `<album-artist> <album>`, the album without its bracketed
+//! parts, then the bare album restricted to the paths that name the artist. Its
+//! candidates are peer folders rather than files, because a whole album lives in
+//! one folder and the server maps that folder's files to the album's tracks.
+//!
 //! Everything here is pure: it never touches the network, so it is unit-tested
 //! on the host target against captured response fixtures.
 
@@ -48,6 +54,21 @@ pub struct Variant {
 
 /// The search texts of one query, in the order they are tried.
 pub type Plan = Vec<Variant>;
+
+/// The granularity a search was started for.
+///
+/// A poll maps the responses of a search the same way `start-search` planned
+/// it, so the kind travels with the progress rather than with a call argument.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Kind {
+    /// A wanted track: every accepted file is its own candidate.
+    #[default]
+    Track,
+    /// A wanted album: the accepted files of one peer folder are one
+    /// candidate.
+    Album,
+}
 
 /// Builds the widening plan of one wanted track.
 ///
@@ -93,12 +114,63 @@ pub fn plan(title: &str, artist: &str) -> Plan {
     plan
 }
 
+/// Builds the widening plan of one wanted album.
+///
+/// A peer's folder names the album artist and the album, so the first search
+/// text is both. The bare-album step is always planned, unlike the bare-title
+/// step of [`plan`], because an album's title is often a single word and a
+/// peer's folder then has to be matched by its path.
+///
+/// # Parameters
+///
+/// - `album`: the wanted album's title.
+/// - `album_artist`: the wanted album's artist, or the empty string when the
+///   query does not name one.
+///
+/// # Returns
+///
+/// The search texts to try, in order: `<album-artist> <album>`, the same text
+/// with the bracketed parts of the album removed, and the bare album restricted
+/// to paths that name the artist. A text another variant already carries is not
+/// repeated, and no text is planned when the album is empty.
+///
+/// # Example
+///
+/// ```text
+/// album_plan("OK Computer (Collector's Edition)", "Radiohead") -> [
+///     Variant { text: "Radiohead OK Computer (Collector's Edition)", require_artist: None },
+///     Variant { text: "Radiohead OK Computer", require_artist: None },
+///     Variant { text: "OK Computer (Collector's Edition)", require_artist: Some("Radiohead") },
+/// ]
+/// ```
+pub fn album_plan(album: &str, album_artist: &str) -> Plan {
+    let album = collapse(album);
+    let artist = collapse(album_artist);
+    let mut plan = Plan::new();
+
+    push(&mut plan, join(&artist, &album), None);
+
+    let stripped = strip_brackets(&album);
+    if !stripped.is_empty() {
+        push(&mut plan, join(&artist, &stripped), None);
+    }
+
+    let artist = (!artist.is_empty()).then(|| artist.clone());
+    push(&mut plan, album, artist);
+
+    plan
+}
+
 /// The widening progress of one search, as it is kept between calls.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Progress {
     /// The variants to try, in order.
     pub plan: Plan,
+    /// The granularity the search was started for, which decides how a poll
+    /// maps its responses into candidates.
+    #[serde(default)]
+    pub kind: Kind,
     /// Index of the variant being searched, or of the next one to start.
     pub index: u32,
     /// Id of the slskd search that is running, when one is.
@@ -115,13 +187,15 @@ impl Progress {
     /// # Parameters
     ///
     /// - `plan`: the variants to try.
+    /// - `kind`: the granularity the search was started for.
     ///
     /// # Returns
     ///
     /// The progress, pointing at the plan's first variant.
-    pub fn new(plan: Plan) -> Self {
+    pub fn new(plan: Plan, kind: Kind) -> Self {
         Self {
             plan,
+            kind,
             index: 0,
             search_id: None,
             done: false,
@@ -283,6 +357,136 @@ pub fn candidates(
     Ok(candidates)
 }
 
+/// The accepted files of one peer folder, gathered while mapping a search.
+struct Folder<'a> {
+    /// Name of the peer that shares the folder.
+    username: String,
+    /// Remote directory the files share, with the peer's own separators.
+    directory: String,
+    /// The accepted files of the folder, in response order.
+    files: Vec<&'a slskd::File>,
+    /// The peer's transfer information, which the candidate carries.
+    source: SourceInfo,
+}
+
+/// Turns the responses of one album search into candidates.
+///
+/// A whole album lives in one peer folder, so the unit of a candidate is the
+/// folder, not the file: the server maps the folder's files to the album's
+/// tracks itself. Grouping by the peer as well as the directory keeps two peers
+/// that share a folder of the same name apart, which matters because a download
+/// asks one peer for one folder.
+///
+/// # Parameters
+///
+/// - `search_id`: id of the search the responses came from; it is recorded in
+///   the candidate tokens.
+/// - `responses`: the peer responses, as the responses endpoint reports them.
+/// - `filter`: what to skip.
+/// - `require_artist`: when set, a file counts only when its remote path
+///   contains this artist, compared case-insensitively.
+///
+/// # Returns
+///
+/// One candidate per peer folder, in first-seen order, holding every accepted
+/// file of that folder; a folder none of whose files is accepted yields no
+/// candidate. A file is accepted by the same rules as in [`candidates`], and
+/// its `track-index` stays empty: the file name and the duration are what the
+/// server maps with.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::Internal`] when a candidate token cannot be
+/// encoded, which cannot happen for the payloads built here.
+pub fn album_candidates(
+    search_id: &str,
+    responses: &[slskd::SearchResponse],
+    filter: &Filter,
+    require_artist: Option<&str>,
+) -> Result<Vec<Candidate>, ProviderError> {
+    let mut folders: Vec<Folder> = Vec::new();
+
+    for response in responses {
+        if response.queue_length > filter.max_peer_queue_length {
+            continue;
+        }
+
+        for file in &response.files {
+            if file.is_locked || !filter.accepts(&extension(file)) {
+                continue;
+            }
+
+            if let Some(artist) = require_artist
+                && !names_artist(&file.filename, artist)
+            {
+                continue;
+            }
+
+            let directory = slskd::directory(&file.filename).to_string();
+
+            match folders.iter_mut().find(|folder| {
+                folder.username == response.username && folder.directory == directory
+            }) {
+                Some(folder) => folder.files.push(file),
+                None => folders.push(Folder {
+                    username: response.username.clone(),
+                    directory,
+                    files: vec![file],
+                    source: source_info(response),
+                }),
+            }
+        }
+    }
+
+    folders
+        .iter()
+        .map(|folder| album_candidate(search_id, folder))
+        .collect()
+}
+
+/// Builds the candidate of one peer folder.
+///
+/// # Parameters
+///
+/// - `search_id`: id of the search the folder came from.
+/// - `folder`: the peer and directory that shared the files.
+///
+/// # Returns
+///
+/// The candidate, whose title is the folder's own name and whose path is the
+/// remote directory, carrying a token that names the peer and every file of
+/// the folder.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::Internal`] when the token cannot be encoded.
+fn album_candidate(search_id: &str, folder: &Folder<'_>) -> Result<Candidate, ProviderError> {
+    let token = tokens::encode(&tokens::CandidateToken {
+        search_id: Some(search_id.to_string()),
+        username: folder.username.clone(),
+        files: folder
+            .files
+            .iter()
+            .map(|file| tokens::RemoteFile {
+                filename: file.filename.clone(),
+                size: file.size,
+            })
+            .collect(),
+    })?;
+
+    Ok(Candidate {
+        token,
+        title: slskd::basename(&folder.directory).to_string(),
+        path: folder.directory.replace('\\', "/"),
+        files: folder
+            .files
+            .iter()
+            .map(|file| candidate_file(file))
+            .collect(),
+        source: folder.source.clone(),
+    })
+}
+
 /// Builds the candidate of one accepted file.
 ///
 /// # Parameters
@@ -303,7 +507,6 @@ fn candidate(
     response: &slskd::SearchResponse,
     file: &slskd::File,
 ) -> Result<Candidate, ProviderError> {
-    let name = slskd::basename(&file.filename);
     let token = tokens::encode(&tokens::CandidateToken {
         search_id: Some(search_id.to_string()),
         username: response.username.clone(),
@@ -317,23 +520,52 @@ fn candidate(
         token,
         title: slskd::stem(&file.filename).to_string(),
         path: file.filename.replace('\\', "/"),
-        files: vec![CandidateFile {
-            name: name.to_string(),
-            size: Some(file.size),
-            format: Some(extension(file)),
-            bitrate_kbps: file.bit_rate,
-            sample_rate: file.sample_rate,
-            bit_depth: file.bit_depth.and_then(|depth| u8::try_from(depth).ok()),
-            duration_ms: file.length.and_then(|seconds| seconds.checked_mul(1_000)),
-            track_index: None,
-        }],
-        source: SourceInfo {
-            key: response.username.clone(),
-            speed_bps: Some(response.upload_speed),
-            queue_length: Some(u32::try_from(response.queue_length).unwrap_or(u32::MAX)),
-            free_slot: Some(response.has_free_upload_slot),
-        },
+        files: vec![candidate_file(file)],
+        source: source_info(response),
     })
+}
+
+/// Maps one file of a peer response to the candidate file the interface
+/// reports.
+///
+/// # Parameters
+///
+/// - `file`: the file, as the peer reported it.
+///
+/// # Returns
+///
+/// The file's name, size, format and audio properties. `track-index` stays
+/// empty: slskd reports no track number, and the server matches files to tracks
+/// by name, duration and score.
+fn candidate_file(file: &slskd::File) -> CandidateFile {
+    CandidateFile {
+        name: slskd::basename(&file.filename).to_string(),
+        size: Some(file.size),
+        format: Some(extension(file)),
+        bitrate_kbps: file.bit_rate,
+        sample_rate: file.sample_rate,
+        bit_depth: file.bit_depth.and_then(|depth| u8::try_from(depth).ok()),
+        duration_ms: file.length.and_then(|seconds| seconds.checked_mul(1_000)),
+        track_index: None,
+    }
+}
+
+/// Maps a peer response to the source information the interface reports.
+///
+/// # Parameters
+///
+/// - `response`: the peer that answered.
+///
+/// # Returns
+///
+/// The peer's name, upload speed, queue length and free-slot flag.
+fn source_info(response: &slskd::SearchResponse) -> SourceInfo {
+    SourceInfo {
+        key: response.username.clone(),
+        speed_bps: Some(response.upload_speed),
+        queue_length: Some(u32::try_from(response.queue_length).unwrap_or(u32::MAX)),
+        free_slot: Some(response.has_free_upload_slot),
+    }
 }
 
 /// Returns the extension the response reported for a file.
@@ -474,6 +706,11 @@ mod tests {
         serde_json::from_str(include_str!("fixtures/search_responses.json")).unwrap()
     }
 
+    /// Parses the album response fixture.
+    fn album_responses() -> Vec<slskd::SearchResponse> {
+        serde_json::from_str(include_str!("fixtures/album_responses.json")).unwrap()
+    }
+
     #[test]
     fn plans_the_artist_and_title_first() {
         let plan = plan("Windowlicker", "Aphex Twin");
@@ -559,6 +796,89 @@ mod tests {
     }
 
     #[test]
+    fn plans_the_album_artist_and_the_album_first() {
+        let plan = album_plan("OK Computer (Collector's Edition)", "Radiohead");
+
+        assert_eq!(
+            plan.iter()
+                .map(|variant| variant.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Radiohead OK Computer (Collector's Edition)",
+                "Radiohead OK Computer",
+                "OK Computer (Collector's Edition)",
+            ]
+        );
+        assert_eq!(plan[0].require_artist, None);
+        assert_eq!(plan[1].require_artist, None);
+        assert_eq!(plan[2].require_artist.as_deref(), Some("Radiohead"));
+    }
+
+    #[test]
+    fn plans_the_bare_album_even_when_it_is_one_word() {
+        let plan = album_plan("OK Computer", "Radiohead");
+
+        assert_eq!(
+            plan.iter()
+                .map(|variant| variant.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Radiohead OK Computer", "OK Computer"]
+        );
+        assert_eq!(plan[1].require_artist.as_deref(), Some("Radiohead"));
+    }
+
+    #[test]
+    fn plans_an_album_without_an_artist_as_one_step() {
+        let plan = album_plan("Kid A", "");
+
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].text, "Kid A");
+        assert_eq!(plan[0].require_artist, None);
+    }
+
+    #[test]
+    fn plans_nothing_without_an_album() {
+        assert!(album_plan("   ", "Radiohead").is_empty());
+        assert!(album_plan("", "").is_empty());
+    }
+
+    #[test]
+    fn widens_an_album_only_while_nothing_was_found() {
+        let mut progress = Progress::new(
+            album_plan("OK Computer (Remastered)", "Radiohead"),
+            Kind::Album,
+        );
+
+        assert_eq!(
+            progress.variant().unwrap().text,
+            "Radiohead OK Computer (Remastered)"
+        );
+        assert_eq!(
+            progress.advance(false).unwrap().text,
+            "Radiohead OK Computer"
+        );
+        assert_eq!(
+            progress.advance(false).unwrap().text,
+            "OK Computer (Remastered)"
+        );
+        assert!(progress.advance(false).is_none());
+        assert!(progress.done);
+    }
+
+    #[test]
+    fn stops_widening_an_album_when_a_variant_found_a_folder() {
+        let mut progress = Progress::new(
+            album_plan("OK Computer (Remastered)", "Radiohead"),
+            Kind::Album,
+        );
+        progress.started("one".to_string());
+
+        assert!(progress.advance(true).is_none());
+        assert!(progress.done);
+        assert_eq!(progress.kind, Kind::Album);
+    }
+
+    #[test]
     fn falls_back_to_the_default_extensions_when_none_are_configured() {
         let config = Config::from_json(r#"{"preferredExtensions":[]}"#).unwrap();
         let filter = Filter::from_config(&config);
@@ -636,6 +956,102 @@ mod tests {
                 size: 48_410_233,
             }
         );
+    }
+
+    #[test]
+    fn groups_an_album_search_into_one_candidate_per_peer_folder() {
+        let responses = album_responses();
+        let found =
+            album_candidates("8f14e45f", &responses, &filter_with(&["flac"], 50), None).unwrap();
+
+        assert_eq!(found.len(), 3, "{found:?}");
+        let album = &found[0];
+
+        assert_eq!(album.title, "OK Computer [FLAC]");
+        assert_eq!(album.path, "@@one/Music/Radiohead/OK Computer [FLAC]");
+        assert_eq!(album.source.key, "peer_one");
+        assert_eq!(album.source.speed_bps, Some(812_345));
+        assert_eq!(album.source.queue_length, Some(0));
+        assert_eq!(album.source.free_slot, Some(true));
+        assert_eq!(album.files.len(), 2);
+        assert_eq!(album.files[0].name, "01 Airbag.flac");
+        assert_eq!(album.files[0].size, Some(1_000));
+        assert_eq!(album.files[0].duration_ms, Some(284_000));
+        assert_eq!(album.files[0].format.as_deref(), Some("flac"));
+        assert_eq!(album.files[1].name, "02 Paranoid Android.flac");
+        assert!(album.files.iter().all(|file| file.track_index.is_none()));
+
+        assert_eq!(found[1].title, "Mixtape");
+        assert_eq!(found[1].source.key, "peer_one");
+
+        // A locked file does not disqualify its folder; it is simply left out.
+        assert_eq!(found[2].title, "OK Computer");
+        assert_eq!(found[2].source.key, "peer_two");
+        assert_eq!(found[2].files.len(), 1);
+        assert_eq!(found[2].source.free_slot, Some(false));
+
+        let token: tokens::CandidateToken = tokens::decode(&album.token).unwrap();
+        assert_eq!(token.search_id.as_deref(), Some("8f14e45f"));
+        assert_eq!(token.username, "peer_one");
+        assert_eq!(token.files.len(), 2);
+        assert_eq!(
+            token.files[0],
+            tokens::RemoteFile {
+                filename: "@@one\\Music\\Radiohead\\OK Computer [FLAC]\\01 Airbag.flac".to_string(),
+                size: 1_000,
+            }
+        );
+    }
+
+    #[test]
+    fn keeps_only_the_folders_that_name_the_album_artist() {
+        let responses = album_responses();
+        let found = album_candidates(
+            "s",
+            &responses,
+            &filter_with(&["flac"], 50),
+            Some("radiohead"),
+        )
+        .unwrap();
+
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(
+            found
+                .iter()
+                .all(|candidate| candidate.path.to_lowercase().contains("radiohead"))
+        );
+
+        let other =
+            album_candidates("s", &responses, &filter_with(&["flac"], 50), Some("Beck")).unwrap();
+        assert!(other.is_empty(), "{other:?}");
+    }
+
+    #[test]
+    fn keeps_folders_of_the_same_name_apart_by_peer() {
+        let peer = |username: &str| -> slskd::SearchResponse {
+            serde_json::from_value(serde_json::json!({
+                "username": username,
+                "files": [{
+                    "filename": "Music\\Radiohead\\OK Computer\\01 Airbag.flac",
+                    "size": 10,
+                    "extension": "flac"
+                }]
+            }))
+            .unwrap()
+        };
+
+        let found = album_candidates(
+            "s",
+            &[peer("one"), peer("two")],
+            &filter_with(&["flac"], 50),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].source.key, "one");
+        assert_eq!(found[1].source.key, "two");
+        assert_eq!(found[0].path, "Music/Radiohead/OK Computer");
     }
 
     #[test]
@@ -723,7 +1139,7 @@ mod tests {
 
     #[test]
     fn advances_through_the_plan_and_stops_when_a_variant_found_something() {
-        let mut progress = Progress::new(plan("Windowlicker (Demo)", "Aphex Twin"));
+        let mut progress = Progress::new(plan("Windowlicker (Demo)", "Aphex Twin"), Kind::Track);
 
         assert_eq!(
             progress.variant().unwrap().text,
@@ -747,7 +1163,7 @@ mod tests {
 
     #[test]
     fn exhausts_the_plan_when_nothing_was_found() {
-        let mut progress = Progress::new(plan("Windowlicker Song", "Aphex Twin"));
+        let mut progress = Progress::new(plan("Windowlicker Song", "Aphex Twin"), Kind::Track);
 
         assert_eq!(progress.advance(false).unwrap().text, "Windowlicker Song");
         assert!(progress.advance(false).is_none());
@@ -756,7 +1172,7 @@ mod tests {
 
     #[test]
     fn an_empty_plan_is_over_immediately() {
-        let mut progress = Progress::new(Plan::new());
+        let mut progress = Progress::new(Plan::new(), Kind::Track);
 
         assert!(progress.variant().is_none());
         assert!(progress.advance(false).is_none());
@@ -765,10 +1181,20 @@ mod tests {
 
     #[test]
     fn keeps_the_progress_across_a_json_round_trip() {
-        let mut progress = Progress::new(plan("Windowlicker (Demo)", "Aphex Twin"));
+        let mut progress = Progress::new(album_plan("OK Computer", "Radiohead"), Kind::Album);
         progress.started("8f14e45f".to_string());
 
         let json = serde_json::to_string(&progress).unwrap();
+        assert!(json.contains("\"kind\":\"album\""), "{json}");
         assert_eq!(serde_json::from_str::<Progress>(&json).unwrap(), progress);
+    }
+
+    #[test]
+    fn reads_progress_written_before_the_kind_was_stored() {
+        let progress: Progress =
+            serde_json::from_str(r#"{"plan":[{"text":"Windowlicker"}],"index":0,"done":false}"#)
+                .unwrap();
+
+        assert_eq!(progress.kind, Kind::Track);
     }
 }
