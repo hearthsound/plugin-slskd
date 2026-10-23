@@ -2,7 +2,7 @@
   "manifestVersion": 1,
   "id": "app.hearthsound.slskd",
   "name": "slskd acquisition",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Acquire tracks and albums from the Soulseek network through a slskd instance.",
   "authors": ["Hearthsound contributors"],
   "license": "MIT OR Apache-2.0",

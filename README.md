@@ -51,7 +51,7 @@ Then validate the manifest and the component:
 hsplugin check
 ```
 
-It prints `ok: app.hearthsound.slskd 0.1.1 (provides acquisition)` on success.
+It prints `ok: app.hearthsound.slskd 0.2.0 (provides acquisition)` on success.
 
 Finally, build the archive you install on a server:
 
