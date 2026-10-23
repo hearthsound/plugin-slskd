@@ -36,7 +36,7 @@ The component lands at
 Install the plugin CLI from the SDK repository:
 
 ```console
-cargo install --locked --git https://github.com/hearthsound/plugin-sdk --tag v0.2.0 hearthsound-plugin-cli
+cargo install --locked --git https://github.com/hearthsound/plugin-sdk --tag v0.3.0 hearthsound-plugin-cli
 ```
 
 Then validate the manifest and the component:

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The plugin targets plugin API `hearthsound:plugin@0.3.0` and builds against
+  SDK v0.3.0. No behaviour changes.
+
 ## [0.1.1] - 2026-10-16
 
 ### Changed

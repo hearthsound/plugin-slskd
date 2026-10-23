@@ -25,7 +25,7 @@ jobs:
       - name: Build the plugin
         run: cargo build --release --locked --target wasm32-wasip2
       - name: Install hsplugin
-        run: cargo install --locked --git https://github.com/hearthsound/plugin-sdk --tag v0.2.0 hearthsound-plugin-cli
+        run: cargo install --locked --git https://github.com/hearthsound/plugin-sdk --tag v0.3.0 hearthsound-plugin-cli
       - name: Check the plugin
         run: hsplugin check
       - name: Pack the plugin
