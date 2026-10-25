@@ -138,6 +138,9 @@ requests, and the server already bounds how many searches run at once.
   otherwise cancels the download's transfers and reports `failed`. A download
   with at least one file moving is `running`, even when other files still wait
   in a peer's queue.
+- Cancelling a download is best effort: `cancel-download` cannot report an error,
+  so a plugin that cannot read its configuration logs why and leaves the
+  transfers to the instance's own queue management.
 - Finished transfers are cleared from slskd with `?remove=false`, which leaves
   the files on disk for the host to import. A cancelled download is cleared with
   `?remove=true`, which also deletes the partial files under the plugin's own
