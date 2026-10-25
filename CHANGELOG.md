@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-25
+
 ### Added
 
 - Failed downloads leave nothing behind: a batch that slskd partly refuses is
@@ -32,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   destination directory.
 - `cancel-download` logs why it cannot reach the instance instead of returning
   silently.
+- Build against the `hearthsound:plugin@0.4.0` API (plugin-sdk v0.4.0).
+
 ## [0.2.0] - 2026-10-23
 
 ### Added
@@ -76,7 +80,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A CI workflow that formats, lints, tests, builds, checks and packs the
   plugin, and uploads the archive.
 
-[Unreleased]: https://github.com/hearthsound/plugin-slskd/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/hearthsound/plugin-slskd/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/hearthsound/plugin-slskd/releases/tag/v0.3.0
 [0.2.0]: https://github.com/hearthsound/plugin-slskd/releases/tag/v0.2.0
 [0.1.1]: https://github.com/hearthsound/plugin-slskd/releases/tag/v0.1.1
 [0.1.0]: https://github.com/hearthsound/plugin-slskd/releases/tag/v0.1.0
