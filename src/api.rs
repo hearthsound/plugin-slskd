@@ -4,6 +4,10 @@
 //! base URL and API key, builds the requests the slskd endpoints expect, and
 //! maps a failing response to the provider error the server sees. The endpoints
 //! themselves are composed by the modules that call this one.
+//!
+//! [`Transport`] is the seam the download logic is tested through: the default
+//! transport hands each request to the host, and the unit tests hand it a fake
+//! that records the request and answers from a fixture.
 
 use hearthsound_plugin::host::http::{Request, Response};
 use hearthsound_plugin::http;
@@ -19,16 +23,53 @@ use crate::version;
 /// The host clamps this to its own ceiling and to the remaining call deadline.
 const REQUEST_TIMEOUT_MS: u32 = 10_000;
 
+/// Performs one HTTP request.
+///
+/// The client builds requests and reads responses; where the bytes travel is
+/// the transport's business. That is what lets the download logic be unit-tested
+/// on the host target, where the `host-http` import of the shipped wasm build
+/// does not exist.
+pub(crate) trait Transport {
+    /// Sends one request and returns its response, whatever its status.
+    ///
+    /// # Parameters
+    ///
+    /// - `request`: the request to perform.
+    ///
+    /// # Returns
+    ///
+    /// The response.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport's own failure: [`ProviderError::Unauthorized`] for
+    /// a request the host denied and [`ProviderError::Unavailable`] for one it
+    /// could not complete.
+    fn send(&self, request: &Request) -> Result<Response, ProviderError>;
+}
+
+/// The transport that sends requests through the `host-http` host import.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct HttpTransport;
+
+impl Transport for HttpTransport {
+    fn send(&self, request: &Request) -> Result<Response, ProviderError> {
+        http::send(request)
+    }
+}
+
 /// One slskd instance, as this provider instance is configured for it.
 #[derive(Debug, Clone)]
-pub(crate) struct Client {
+pub(crate) struct Client<T: Transport = HttpTransport> {
     /// Base URL of the instance, trimmed and without a trailing slash.
     base_url: String,
     /// API key sent as `X-API-Key` on every request.
     api_key: String,
+    /// Carries the requests to the instance.
+    transport: T,
 }
 
-impl Client {
+impl Client<HttpTransport> {
     /// Builds a client for one instance.
     ///
     /// # Parameters
@@ -39,6 +80,29 @@ impl Client {
         Self {
             base_url: url::normalize_base_url(base_url),
             api_key: api_key.to_string(),
+            transport: HttpTransport,
+        }
+    }
+}
+
+impl<T: Transport> Client<T> {
+    /// Builds a client over a transport other than the host's.
+    ///
+    /// # Parameters
+    ///
+    /// - `base_url`: the configured base URL, with or without a trailing slash.
+    /// - `api_key`: the configured API key.
+    /// - `transport`: where the requests travel.
+    ///
+    /// # Returns
+    ///
+    /// A client that hands every request to `transport`.
+    #[cfg(test)]
+    pub(crate) fn with_transport(base_url: &str, api_key: &str, transport: T) -> Self {
+        Self {
+            base_url: url::normalize_base_url(base_url),
+            api_key: api_key.to_string(),
+            transport,
         }
     }
 
@@ -75,8 +139,8 @@ impl Client {
     ///
     /// Returns the mapped status of a failing response, an unavailable error
     /// when the host cannot complete the request, and an internal error when
-    /// the body is not JSON for `T`.
-    pub(crate) fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, ProviderError> {
+    /// the body is not JSON for `R`.
+    pub(crate) fn get_json<R: DeserializeOwned>(&self, path: &str) -> Result<R, ProviderError> {
         self.send_json(&self.request("GET", path))
     }
 
@@ -96,12 +160,12 @@ impl Client {
     /// Returns the mapped status of a failing response, an unavailable error
     /// when the host cannot complete the request, [`ProviderError::Internal`]
     /// when the body cannot be serialized, and an internal error when the
-    /// response is not JSON for `T`.
-    pub(crate) fn post_json<B: Serialize, T: DeserializeOwned>(
+    /// response is not JSON for `R`.
+    pub(crate) fn post_json<B: Serialize, R: DeserializeOwned>(
         &self,
         path: &str,
         body: &B,
-    ) -> Result<T, ProviderError> {
+    ) -> Result<R, ProviderError> {
         let response = self.post(path, body)?;
         require_success(&response)?;
 
@@ -183,7 +247,7 @@ impl Client {
     /// Returns [`ProviderError::Unauthorized`] when the host denied the request
     /// and [`ProviderError::Unavailable`] when it timed out or failed.
     fn send(&self, request: &Request) -> Result<Response, ProviderError> {
-        http::send(request)
+        self.transport.send(request)
     }
 
     /// Sends a request, requires a successful status and decodes the body.
@@ -199,8 +263,8 @@ impl Client {
     /// # Errors
     ///
     /// Returns the mapped status of a failing response and
-    /// [`ProviderError::Internal`] when the body is not JSON for `T`.
-    fn send_json<T: DeserializeOwned>(&self, request: &Request) -> Result<T, ProviderError> {
+    /// [`ProviderError::Internal`] when the body is not JSON for `R`.
+    fn send_json<R: DeserializeOwned>(&self, request: &Request) -> Result<R, ProviderError> {
         let response = self.send(request)?;
         require_success(&response)?;
 

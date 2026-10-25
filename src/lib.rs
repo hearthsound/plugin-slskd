@@ -73,6 +73,9 @@ const SEARCH_TTL_MS: u64 = 3_600_000;
 /// API path that enqueues a batch of downloads.
 const BATCH_PATH: &str = "/api/v0/transfers/downloads/batches";
 
+/// The failure `poll-download` reports when slskd lost a download.
+const LOST_DOWNLOAD: &str = "slskd lost the download and its files are not at their pinned paths";
+
 /// The plugin implementation.
 struct Slskd;
 
@@ -308,43 +311,28 @@ impl AcquisitionGuest for Slskd {
         }
 
         let key = random::key();
-        let destination = download::destination(&key);
         let client = client(&config);
-        let mut batches = Vec::new();
 
-        // One batch per remote directory: slskd downloads a batch into one
-        // destination directory and flattens its files, so the files of a batch
-        // have to be the files of one remote directory.
-        for group in download::group_by_directory(&selected) {
-            let id = random::guid();
-            let request = slskd::EnqueueBatchRequest {
-                id: id.clone(),
-                username: candidate.username.clone(),
-                files: group
-                    .files
-                    .iter()
-                    .map(|file| slskd::BatchFile {
-                        filename: file.filename.clone(),
-                        size: file.size,
-                    })
-                    .collect(),
-                options: slskd::BatchOptions {
-                    destination: destination.clone(),
-                },
-            };
+        let batches = match enqueue_batches(&client, &candidate.username, &key, &selected) {
+            Ok(batches) => batches,
+            Err(failure) => {
+                // Nothing keeps downloading behind the caller's back: the
+                // batches that were already enqueued are cancelled, because the
+                // server never sees their ids and so could never cancel them.
+                hearthsound_plugin::warn!(
+                    "cancelled {} batch(es) after a failed enqueue",
+                    failure.cancelled
+                );
 
-            enqueue(&client, &candidate.username, &request)?;
-
-            batches.push(tokens::BatchRef {
-                id,
-                files: download::expected(&group.files),
-            });
-        }
+                return Err(failure.error);
+            }
+        };
 
         hearthsound_plugin::info!(
-            "downloading {} file(s) from {} into {destination} in {} batch(es)",
+            "downloading {} file(s) from {} into {} in {} batch(es)",
             selected.len(),
             candidate.username,
+            download::destination(&key),
             batches.len()
         );
 
@@ -359,68 +347,37 @@ impl AcquisitionGuest for Slskd {
         let config = configured()?;
         let token: tokens::DownloadToken = tokens::decode(&download_token)?;
         let client = client(&config);
+        let size = |path: &str| size_in(&config.import_root, path);
 
-        let expected: Vec<tokens::ExpectedFile> = token
-            .batches
-            .iter()
-            .flat_map(|batch| batch.files.iter().cloned())
-            .collect();
-
-        let mut observed = Vec::new();
-        let mut transfers = Vec::new();
-
-        for batch in &token.batches {
-            match client.get_json::<slskd::Batch>(&batch_path(&batch.id)) {
-                Ok(batch) => {
-                    transfers.extend(batch.transfers.iter().map(|transfer| transfer.id.clone()));
-                    observed.extend(batch.transfers.iter().map(states::Observed::from));
-                }
-                // A batch slskd no longer knows leaves its files unaccounted
-                // for, which the assessment reports as unverifiable.
-                Err(ProviderError::NotFound) => {
-                    hearthsound_plugin::warn!("slskd no longer knows batch {}", batch.id);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        match states::assess(&expected, &observed) {
-            states::Assessment::Failed(message) => {
-                hearthsound_plugin::warn!("download {} failed: {message}", token.key);
-
-                Ok(DownloadState::Failed(message))
-            }
-            states::Assessment::Queued(place) => Ok(DownloadState::Queued(place)),
-            states::Assessment::Running(progress) => {
-                Ok(DownloadState::Running(wit_progress(progress)))
-            }
-            states::Assessment::AwaitingFiles(progress) => {
-                if !files_present(&config, &token.key, &expected) {
-                    // slskd signals a completed transfer before it moves the
-                    // file out of its incomplete directory, so the file is
-                    // only believed once it is at its pinned path.
-                    return Ok(DownloadState::Running(wit_progress(progress)));
+        match poll(&client, &token, &config.import_root, size)? {
+            Polled::State(state) => {
+                if let DownloadState::Failed(message) = &state {
+                    hearthsound_plugin::warn!("download {} failed: {message}", token.key);
                 }
 
-                complete(&client, &token, &transfers);
-
-                Ok(DownloadState::Complete(output_files(
-                    &config, &token.key, &expected,
-                )))
+                Ok(state)
             }
-            states::Assessment::Unverifiable => {
-                if !files_present(&config, &token.key, &expected) {
-                    // The download cannot be judged and its files are not
-                    // there: the server treats this as a lost download and
-                    // restarts the search.
-                    return Err(ProviderError::NotFound);
-                }
+            Polled::Lost => {
+                // slskd cannot be asked about the download any more and its
+                // files are not where the plugin put them: the download is
+                // lost. The transfers of its batches are cancelled first, so
+                // nothing keeps downloading for a candidate that has ended.
+                hearthsound_plugin::warn!(
+                    "slskd lost download {} and its files are not at their pinned paths",
+                    token.key
+                );
 
-                complete(&client, &token, &transfers);
+                Ok(DownloadState::Failed(LOST_DOWNLOAD.to_string()))
+            }
+            Polled::Complete(files) => {
+                hearthsound_plugin::info!(
+                    "download {} from {} produced {} file(s)",
+                    token.key,
+                    token.username,
+                    files.len()
+                );
 
-                Ok(DownloadState::Complete(output_files(
-                    &config, &token.key, &expected,
-                )))
+                Ok(DownloadState::Complete(files))
             }
         }
     }
@@ -432,20 +389,20 @@ impl AcquisitionGuest for Slskd {
             return;
         };
 
+        // Cancellation is best effort: the interface has no way to report a
+        // failure and the acquisition is ending either way, so a plugin that
+        // cannot reach its backend says so in the log and leaves the transfers
+        // to the instance's own queue management.
         let Ok(config) = configured() else {
+            hearthsound_plugin::warn!(
+                "cannot cancel download {}: the instance configuration could not be read",
+                token.key
+            );
+
             return;
         };
 
-        let client = client(&config);
-
-        for batch in &token.batches {
-            let ids: Vec<String> = transfers(&client, &batch.id)
-                .into_iter()
-                .map(|transfer| transfer.id)
-                .collect();
-
-            clear_transfers(&client, &token.username, &ids);
-        }
+        cancel(&client(&config), &token);
     }
 }
 
@@ -494,6 +451,10 @@ fn start_variant(
 
 /// Enqueues one batch of a download.
 ///
+/// A partly accepted batch is cancelled before the error, so nothing downloads
+/// without a token: slskd answers with a success status and a failure list, and
+/// the files it did accept start transferring at once.
+///
 /// # Parameters
 ///
 /// - `client`: the instance's client.
@@ -504,9 +465,13 @@ fn start_variant(
 ///
 /// Returns the mapped error of a failed request, and
 /// [`ProviderError::Internal`] when slskd answered with a status the plugin
-/// cannot use or with failures for the files it enqueued.
-fn enqueue(
-    client: &api::Client,
+/// cannot use or with failures for the files it enqueued. The error stays
+/// internal even when slskd refused every file: its per-file messages name
+/// neither the peer nor its queue reliably, so the plugin cannot claim the
+/// backend is unavailable, and the caller treats either error as a failed
+/// candidate.
+fn enqueue<A: api::Transport>(
+    client: &api::Client<A>,
     username: &str,
     request: &slskd::EnqueueBatchRequest,
 ) -> Result<(), ProviderError> {
@@ -519,10 +484,86 @@ fn enqueue(
     let enqueued: slskd::EnqueueBatchResponse = api::decode(&response)?;
 
     if !enqueued.failures.is_empty() {
+        cancel_batch(client, username, &request.id);
+
         return Err(failures_problem(&enqueued.failures));
     }
 
     Ok(())
+}
+
+/// Why a download could not be enqueued, and what was undone for it.
+struct EnqueueFailure {
+    /// The error the caller returns.
+    error: ProviderError,
+    /// How many files of the batches that were already enqueued were
+    /// cancelled.
+    cancelled: usize,
+}
+
+/// Enqueues every batch of one download.
+///
+/// One batch per remote directory: a batch is downloaded into one destination
+/// directory, so its files have to be the files of one remote directory.
+///
+/// # Parameters
+///
+/// - `client`: the instance's client.
+/// - `username`: the peer the files come from.
+/// - `key`: the download's random key, which names the destination directory.
+/// - `selected`: the files to download, grouped by their remote directory.
+///
+/// # Returns
+///
+/// One entry per enqueued batch, holding its id and the files it is expected to
+/// produce.
+///
+/// # Errors
+///
+/// Returns the error of the batch that failed, after cancelling the batches
+/// that were already enqueued: the caller never receives a token for this
+/// download, so it could never cancel them, and they would keep downloading.
+fn enqueue_batches<A: api::Transport>(
+    client: &api::Client<A>,
+    username: &str,
+    key: &str,
+    selected: &[tokens::RemoteFile],
+) -> Result<Vec<tokens::BatchRef>, EnqueueFailure> {
+    let destination = download::destination(key);
+    let mut batches: Vec<tokens::BatchRef> = Vec::new();
+
+    for group in download::group_by_directory(selected) {
+        let id = random::guid();
+        let request = slskd::EnqueueBatchRequest {
+            id: id.clone(),
+            username: username.to_string(),
+            files: group
+                .files
+                .iter()
+                .map(|file| slskd::BatchFile {
+                    filename: file.filename.clone(),
+                    size: file.size,
+                })
+                .collect(),
+            options: slskd::BatchOptions {
+                destination: destination.clone(),
+            },
+        };
+
+        if let Err(error) = enqueue(client, username, &request) {
+            return Err(EnqueueFailure {
+                error,
+                cancelled: cancel_batches(client, username, &batches),
+            });
+        }
+
+        batches.push(tokens::BatchRef {
+            id,
+            files: download::expected(&group.directory, &group.files),
+        });
+    }
+
+    Ok(batches)
 }
 
 /// Maps a failed batch enqueue to the provider error the server sees.
@@ -591,7 +632,7 @@ fn failures_problem(failures: &[slskd::Failure]) -> ProviderError {
 /// The transfers of the batch, and none when slskd does not know the batch or
 /// the request failed, which the callers of this function treat as "nothing to
 /// do".
-fn transfers(client: &api::Client, id: &str) -> Vec<slskd::Transfer> {
+fn transfers<A: api::Transport>(client: &api::Client<A>, id: &str) -> Vec<slskd::Transfer> {
     match client.get_json::<slskd::Batch>(&batch_path(id)) {
         Ok(batch) => batch.transfers,
         Err(error) => {
@@ -602,20 +643,88 @@ fn transfers(client: &api::Client, id: &str) -> Vec<slskd::Transfer> {
     }
 }
 
+/// Cancels one batch: clears its transfers and deletes their files.
+///
+/// # Parameters
+///
+/// - `client`: the instance's client.
+/// - `username`: the peer the batch's files come from.
+/// - `id`: id of the slskd batch.
+///
+/// # Returns
+///
+/// How many transfers were cleared.
+fn cancel_batch<A: api::Transport>(client: &api::Client<A>, username: &str, id: &str) -> usize {
+    let ids: Vec<String> = transfers(client, id)
+        .into_iter()
+        .map(|transfer| transfer.id)
+        .collect();
+
+    clear_transfers(client, username, &ids, true);
+
+    ids.len()
+}
+
+/// Cancels every batch of a download.
+///
+/// # Parameters
+///
+/// - `client`: the instance's client.
+/// - `username`: the peer the batches' files come from.
+/// - `batches`: the batches to cancel.
+///
+/// # Returns
+///
+/// How many transfers were cleared.
+fn cancel_batches<A: api::Transport>(
+    client: &api::Client<A>,
+    username: &str,
+    batches: &[tokens::BatchRef],
+) -> usize {
+    batches
+        .iter()
+        .map(|batch| cancel_batch(client, username, &batch.id))
+        .sum()
+}
+
+/// Cancels a download: clears every transfer of every batch and deletes their
+/// files.
+///
+/// # Parameters
+///
+/// - `client`: the instance's client.
+/// - `token`: the download's token.
+fn cancel<A: api::Transport>(client: &api::Client<A>, token: &tokens::DownloadToken) {
+    cancel_batches(client, &token.username, &token.batches);
+}
+
 /// Clears one transfer from slskd's records.
 ///
-/// `remove=true` is a record-only delete: slskd marks the transfer removed and
-/// leaves the file where it is, so a file the server has not imported yet is
-/// never touched.
+/// `remove_files` decides what slskd does with the file behind the record:
+///
+/// - `false` after a successful import, which is doc 03's post-import step: the
+///   host either moved the file out of the download directory or left it there
+///   for the import root to keep, so deleting it would destroy a file the host
+///   is about to use (a `copy` or `link` import may still be reading it).
+/// - `true` when a download is cancelled, which is what doc 06 requires ("a
+///   cancelled acquisition leaves no partial file"): the only files this
+///   deletes are the ones under the plugin's own `hearthsound/<key>/`
+///   destination, which no other part of the system writes.
 ///
 /// # Parameters
 ///
 /// - `client`: the instance's client.
 /// - `username`: the peer the transfer belongs to, which its route needs.
 /// - `id`: id of the transfer.
-fn clear_transfer(client: &api::Client, username: &str, id: &str) {
+/// - `remove_files`: whether slskd also deletes the file the transfer wrote.
+fn clear_transfer<A: api::Transport>(
+    client: &api::Client<A>,
+    username: &str,
+    id: &str,
+    remove_files: bool,
+) {
     let path = format!(
-        "/api/v0/transfers/downloads/{}/{}?remove=true",
+        "/api/v0/transfers/downloads/{}/{}?remove={remove_files}",
         url::encode_segment(username),
         id
     );
@@ -629,30 +738,23 @@ fn clear_transfer(client: &api::Client, username: &str, id: &str) {
     }
 }
 
-/// Reports a finished download and clears its transfers from slskd.
+/// Clears a finished download's transfers from slskd.
 ///
 /// slskd keeps every transfer record it is not told to forget, so the plugin
-/// clears the ones it reported. `remove=true` is a record-only delete: the file
-/// itself is left where slskd put it for the server to import.
+/// clears the ones it reported. The flag is `remove_files = false`: the files
+/// themselves stay where slskd put them for the host to import.
 ///
 /// # Parameters
 ///
 /// - `client`: the instance's client.
 /// - `token`: the download's token.
 /// - `transfers`: ids of the transfers to clear.
-fn complete(client: &api::Client, token: &tokens::DownloadToken, transfers: &[String]) {
-    hearthsound_plugin::info!(
-        "download {} from {} produced {} file(s)",
-        token.key,
-        token.username,
-        token
-            .batches
-            .iter()
-            .map(|batch| batch.files.len())
-            .sum::<usize>()
-    );
-
-    clear_transfers(client, &token.username, transfers);
+fn complete<A: api::Transport>(
+    client: &api::Client<A>,
+    token: &tokens::DownloadToken,
+    transfers: &[String],
+) {
+    clear_transfers(client, &token.username, transfers, false);
 }
 
 /// Clears the given transfers from slskd's records, ignoring failures.
@@ -662,60 +764,221 @@ fn complete(client: &api::Client, token: &tokens::DownloadToken, transfers: &[St
 /// - `client`: the instance's client.
 /// - `username`: the peer the transfers belong to.
 /// - `ids`: ids of the transfers.
-fn clear_transfers(client: &api::Client, username: &str, ids: &[String]) {
+/// - `remove_files`: whether slskd also deletes the files the transfers wrote.
+fn clear_transfers<A: api::Transport>(
+    client: &api::Client<A>,
+    username: &str,
+    ids: &[String],
+    remove_files: bool,
+) {
     for id in ids {
-        clear_transfer(client, username, id);
+        clear_transfer(client, username, id, remove_files);
     }
 }
 
-/// Returns whether every expected file is present at its pinned path.
+/// Returns whether every expected file is present at one of its paths.
 ///
 /// # Parameters
 ///
-/// - `config`: the instance configuration, which names the import root.
 /// - `key`: the download's key, which names the destination directory.
 /// - `expected`: the files the download is expected to produce.
+/// - `size`: the size of the regular file at one path under the import root.
 ///
 /// # Returns
 ///
 /// `true` when every file is a regular file of exactly the expected size. A
 /// file that is still being written, renamed or missing makes this `false`.
-fn files_present(config: &config::Config, key: &str, expected: &[tokens::ExpectedFile]) -> bool {
-    expected.iter().all(|file| {
-        let path = download::pinned_path(key, &file.name);
+fn files_present<S>(key: &str, expected: &[tokens::ExpectedFile], size: S) -> bool
+where
+    S: Fn(&str) -> Option<u64>,
+{
+    expected
+        .iter()
+        .all(|file| located(key, file, &size).is_some())
+}
 
-        match host::files::stat(&config.import_root, &path) {
-            Some(stat) => !stat.is_dir && stat.size == file.size,
-            None => false,
-        }
-    })
+/// Finds one downloaded file under its download's destination directory.
+///
+/// slskd downloads a batch into one destination directory and either flattens
+/// its files to their names or keeps their remote subfolders. The plugin
+/// accepts either layout, so both paths are tried and the one whose size
+/// matches is reported.
+///
+/// # Parameters
+///
+/// - `key`: the download's key, which names the destination directory.
+/// - `file`: the file to find.
+/// - `size`: the size of the regular file at one path under the import root.
+///
+/// # Returns
+///
+/// The path of the file, relative to the import root, or `None` when it is at
+/// neither of its paths or has the wrong size.
+fn located<S>(key: &str, file: &tokens::ExpectedFile, size: S) -> Option<String>
+where
+    S: Fn(&str) -> Option<u64>,
+{
+    let flattened = download::pinned_path(key, &file.name);
+
+    if size(&flattened) == Some(file.size) {
+        return Some(flattened);
+    }
+
+    if file.relative.is_empty() || file.relative == file.name {
+        return None;
+    }
+
+    let nested = download::pinned_path(key, &file.relative);
+    (size(&nested) == Some(file.size)).then_some(nested)
+}
+
+/// Returns the size of the regular file at one path under an import root.
+///
+/// # Parameters
+///
+/// - `root`: the import root id.
+/// - `path`: the path, relative to the root.
+///
+/// # Returns
+///
+/// The size in bytes, and `None` for a directory or a path the host does not
+/// have.
+fn size_in(root: &str, path: &str) -> Option<u64> {
+    match host::files::stat(root, path) {
+        Some(stat) if !stat.is_dir => Some(stat.size),
+        _ => None,
+    }
 }
 
 /// Builds the output files of a completed download.
 ///
 /// # Parameters
 ///
-/// - `config`: the instance configuration, which names the import root.
+/// - `root`: the import root id.
 /// - `key`: the download's key.
 /// - `expected`: the files the download produced.
+/// - `size`: the size of the regular file at one path under the import root.
 ///
 /// # Returns
 ///
-/// One output file per expected file, naming the import root and the pinned
-/// path.
-fn output_files(
-    config: &config::Config,
+/// One output file per expected file, naming the import root and the path the
+/// file was found at. The completion check has just passed, so every file is at
+/// one of its paths; a file that vanished in between is reported at its
+/// flattened path and the host fails to import it.
+fn output_files<S>(
+    root: &str,
     key: &str,
     expected: &[tokens::ExpectedFile],
-) -> Vec<OutputFile> {
+    size: S,
+) -> Vec<OutputFile>
+where
+    S: Fn(&str) -> Option<u64>,
+{
     expected
         .iter()
         .map(|file| OutputFile {
-            root: config.import_root.clone(),
-            path: download::pinned_path(key, &file.name),
+            root: root.to_string(),
+            path: located(key, file, &size)
+                .unwrap_or_else(|| download::pinned_path(key, &file.name)),
             track_index: None,
         })
         .collect()
+}
+
+/// What one poll of a download found.
+enum Polled {
+    /// The download has not finished; the state to report as it is.
+    State(DownloadState),
+    /// slskd lost the download and its files are not at their paths: its
+    /// batches have been cancelled and the download failed.
+    Lost,
+    /// Every expected file is at its path; these are the files it produced.
+    Complete(Vec<OutputFile>),
+}
+
+/// Polls one download and decides what it is.
+///
+/// A batch slskd no longer knows contributes no transfers, which leaves its
+/// files unaccounted for and makes the assessment unverifiable.
+///
+/// # Parameters
+///
+/// - `client`: the instance's client.
+/// - `token`: the download's token.
+/// - `root`: the import root id, which the output files name.
+/// - `size`: the size of the regular file at one path under the import root.
+///
+/// # Returns
+///
+/// The [`Polled`] outcome.
+///
+/// # Errors
+///
+/// Returns the mapped error of a batch request that failed for a reason other
+/// than slskd not knowing the batch.
+fn poll<A: api::Transport, S>(
+    client: &api::Client<A>,
+    token: &tokens::DownloadToken,
+    root: &str,
+    size: S,
+) -> Result<Polled, ProviderError>
+where
+    S: Fn(&str) -> Option<u64>,
+{
+    let expected: Vec<tokens::ExpectedFile> = token
+        .batches
+        .iter()
+        .flat_map(|batch| batch.files.iter().cloned())
+        .collect();
+
+    let mut observed = Vec::new();
+    let mut transfers = Vec::new();
+
+    for batch in &token.batches {
+        match client.get_json::<slskd::Batch>(&batch_path(&batch.id)) {
+            Ok(batch) => {
+                transfers.extend(batch.transfers.iter().map(|transfer| transfer.id.clone()));
+                observed.extend(batch.transfers.iter().map(states::Observed::from));
+            }
+            Err(ProviderError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    let outcome = match states::assess(&expected, &observed) {
+        states::Assessment::Failed(message) => Polled::State(DownloadState::Failed(message)),
+        states::Assessment::Queued(place) => Polled::State(DownloadState::Queued(place)),
+        states::Assessment::Running(progress) => {
+            Polled::State(DownloadState::Running(wit_progress(progress)))
+        }
+        states::Assessment::AwaitingFiles(progress) => {
+            if !files_present(&token.key, &expected, &size) {
+                // slskd signals a completed transfer before it moves the file
+                // out of its incomplete directory, so the file is only believed
+                // once it is at one of its paths.
+                return Ok(Polled::State(DownloadState::Running(wit_progress(
+                    progress,
+                ))));
+            }
+
+            complete(client, token, &transfers);
+
+            Polled::Complete(output_files(root, &token.key, &expected, &size))
+        }
+        states::Assessment::Unverifiable => {
+            if !files_present(&token.key, &expected, &size) {
+                cancel_batches(client, &token.username, &token.batches);
+
+                return Ok(Polled::Lost);
+            }
+
+            complete(client, token, &transfers);
+
+            Polled::Complete(output_files(root, &token.key, &expected, &size))
+        }
+    };
+
+    Ok(outcome)
 }
 
 /// Converts the plugin's progress into the interface's record.
@@ -1064,14 +1327,17 @@ mod tests {
 
     #[test]
     fn pins_output_files_under_the_import_root() {
-        let config = config::Config::from_json(r#"{"importRoot":"slskd-downloads"}"#).unwrap();
-        let expected = vec![tokens::ExpectedFile {
-            filename: "@@tqkz\\Music\\01 Song.flac".to_string(),
-            name: "01 Song.flac".to_string(),
-            size: 4_841,
-        }];
-
-        let files = output_files(&config, "0f8b", &expected);
+        let expected = vec![expected_file(
+            "@@tqkz\\Music\\01 Song.flac",
+            "01 Song.flac",
+            4_841,
+        )];
+        let files = output_files(
+            "slskd-downloads",
+            "0f8b",
+            &expected,
+            present(&[("hearthsound/0f8b/01 Song.flac", 4_841)]),
+        );
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].root, "slskd-downloads");
@@ -1100,6 +1366,347 @@ mod tests {
                 if message.contains("2 file(s)")
                     && message.contains("a.mp3")
                     && message.contains("queue full")
+        ));
+    }
+
+    /// Base URL of the fake instance.
+    const BASE: &str = "http://slskd:5030";
+
+    /// Builds an expected file.
+    fn expected_file(filename: &str, relative: &str, size: u64) -> tokens::ExpectedFile {
+        tokens::ExpectedFile {
+            filename: filename.to_string(),
+            name: slskd::basename(filename).to_string(),
+            relative: relative.to_string(),
+            size,
+        }
+    }
+
+    /// Builds the stat replacement the poll uses, over the given paths.
+    fn present(files: &[(&str, u64)]) -> impl Fn(&str) -> Option<u64> {
+        let files: Vec<(String, u64)> = files
+            .iter()
+            .map(|(path, size)| (path.to_string(), *size))
+            .collect();
+
+        move |path: &str| {
+            files
+                .iter()
+                .find(|(known, _)| known == path)
+                .map(|(_, size)| *size)
+        }
+    }
+
+    /// The requests and the remaining routes of a [`Fake`].
+    #[derive(Default)]
+    struct FakeState {
+        /// Answers left, each with the call fragment it answers.
+        routes: Vec<(&'static str, u16, &'static str)>,
+        /// Every request the client sent.
+        requests: Vec<host::http::Request>,
+    }
+
+    /// A transport that answers recorded requests and remembers what it was
+    /// asked, so the download logic can be tested without an slskd instance.
+    ///
+    /// Each route is used once, so two enqueues can answer differently. A
+    /// clone shares the state, which is how a test reads the calls back after
+    /// handing the transport to a client.
+    #[derive(Clone, Default)]
+    struct Fake {
+        state: std::rc::Rc<std::cell::RefCell<FakeState>>,
+    }
+
+    impl Fake {
+        /// Builds a transport that answers the given routes, in order.
+        fn new(routes: &[(&'static str, u16, &'static str)]) -> Self {
+            Self {
+                state: std::rc::Rc::new(std::cell::RefCell::new(FakeState {
+                    routes: routes.to_vec(),
+                    requests: Vec::new(),
+                })),
+            }
+        }
+
+        /// Returns the calls the client made, as method and path.
+        fn calls(&self) -> Vec<String> {
+            self.state
+                .borrow()
+                .requests
+                .iter()
+                .map(|request| {
+                    let url = request.url.strip_prefix(BASE).unwrap_or(&request.url);
+
+                    format!("{} {url}", request.method)
+                })
+                .collect()
+        }
+    }
+
+    impl api::Transport for Fake {
+        fn send(
+            &self,
+            request: &host::http::Request,
+        ) -> Result<host::http::Response, ProviderError> {
+            let url = request.url.strip_prefix(BASE).unwrap_or(&request.url);
+            let call = format!("{} {url}", request.method);
+            let mut state = self.state.borrow_mut();
+            state.requests.push(request.clone());
+
+            let index = state
+                .routes
+                .iter()
+                .position(|(fragment, _, _)| call.contains(fragment));
+
+            let Some(index) = index else {
+                return Err(ProviderError::Unavailable(format!("no route for {call}")));
+            };
+
+            let (_, status, body) = state.routes.remove(index);
+
+            Ok(host::http::Response {
+                status,
+                headers: Vec::new(),
+                body: body.as_bytes().to_vec(),
+            })
+        }
+    }
+
+    /// One batch of a download, answered by [`Fake`] with two transfers.
+    const A_BATCH: &str = r#"{"id":"b1","username":"peer_free","transfers":[{"id":"t1","filename":"peer\\A\\one.flac"},{"id":"t2","filename":"peer\\B\\two.flac"}]}"#;
+
+    #[test]
+    fn cancels_the_batches_it_already_enqueued() {
+        let fake = Fake::new(&[
+            (
+                "POST /api/v0/transfers/downloads/batches",
+                201,
+                r#"{"failures":[]}"#,
+            ),
+            ("POST /api/v0/transfers/downloads/batches", 429, ""),
+            ("GET /api/v0/transfers/downloads/batches/", 200, A_BATCH),
+            ("DELETE /api/v0/transfers/downloads/", 204, ""),
+            ("DELETE /api/v0/transfers/downloads/", 204, ""),
+        ]);
+        let client = api::Client::with_transport(BASE, "key", fake.clone());
+        let selected = vec![
+            tokens::RemoteFile {
+                filename: "peer\\A\\one.flac".to_string(),
+                size: 1,
+            },
+            tokens::RemoteFile {
+                filename: "peer\\B\\two.flac".to_string(),
+                size: 2,
+            },
+        ];
+
+        let failure = enqueue_batches(&client, "peer_free", "0f8b", &selected).unwrap_err();
+
+        assert!(matches!(
+            failure.error,
+            ProviderError::Unavailable(message) if message.contains("throttling")
+        ));
+        assert_eq!(failure.cancelled, 2);
+        assert_eq!(
+            fake.calls()
+                .into_iter()
+                .filter(|call| call.starts_with("DELETE"))
+                .collect::<Vec<String>>(),
+            vec![
+                "DELETE /api/v0/transfers/downloads/peer_free/t1?remove=true".to_string(),
+                "DELETE /api/v0/transfers/downloads/peer_free/t2?remove=true".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cancels_a_partly_accepted_batch() {
+        let fake = Fake::new(&[
+            (
+                "POST /api/v0/transfers/downloads/batches",
+                201,
+                r#"{"failures":[{"filename":"b.mp3","message":"queue full"}]}"#,
+            ),
+            (
+                "GET /api/v0/transfers/downloads/batches/",
+                200,
+                r#"{"transfers":[{"id":"t1","filename":"a.mp3"}]}"#,
+            ),
+            ("DELETE /api/v0/transfers/downloads/", 204, ""),
+        ]);
+        let client = api::Client::with_transport(BASE, "key", fake.clone());
+        let request = slskd::EnqueueBatchRequest {
+            id: "b1".to_string(),
+            username: "peer_free".to_string(),
+            files: vec![
+                slskd::BatchFile {
+                    filename: "a.mp3".to_string(),
+                    size: 1,
+                },
+                slskd::BatchFile {
+                    filename: "b.mp3".to_string(),
+                    size: 2,
+                },
+            ],
+            options: slskd::BatchOptions {
+                destination: "hearthsound/0f8b".to_string(),
+            },
+        };
+
+        let error = enqueue(&client, "peer_free", &request).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProviderError::Internal(message) if message.contains("queue full")
+        ));
+        assert_eq!(
+            fake.calls()
+                .into_iter()
+                .filter(|call| call.starts_with("DELETE"))
+                .collect::<Vec<String>>(),
+            vec!["DELETE /api/v0/transfers/downloads/peer_free/t1?remove=true".to_string()]
+        );
+    }
+
+    #[test]
+    fn clears_imported_transfers_without_removing_the_files() {
+        let fake = Fake::new(&[("DELETE /api/v0/transfers/downloads/", 204, "")]);
+        let client = api::Client::with_transport(BASE, "key", fake.clone());
+        let token = tokens::DownloadToken {
+            key: "0f8b".to_string(),
+            username: "peer_free".to_string(),
+            batches: Vec::new(),
+        };
+
+        complete(&client, &token, &["t1".to_string()]);
+
+        assert_eq!(
+            fake.calls(),
+            vec!["DELETE /api/v0/transfers/downloads/peer_free/t1?remove=false".to_string()]
+        );
+    }
+
+    #[test]
+    fn fails_a_lost_download_and_cancels_it() {
+        let fake = Fake::new(&[
+            (
+                "GET /api/v0/transfers/downloads/batches/",
+                200,
+                r#"{"transfers":[{"id":"t9","filename":"peer\\A\\other.flac","state":"Completed, Succeeded"}]}"#,
+            ),
+            (
+                "GET /api/v0/transfers/downloads/batches/",
+                200,
+                r#"{"transfers":[{"id":"t9","filename":"peer\\A\\other.flac"}]}"#,
+            ),
+            ("DELETE /api/v0/transfers/downloads/", 204, ""),
+        ]);
+        let client = api::Client::with_transport(BASE, "key", fake.clone());
+        let token = tokens::DownloadToken {
+            key: "0f8b".to_string(),
+            username: "peer_free".to_string(),
+            batches: vec![tokens::BatchRef {
+                id: "b1".to_string(),
+                files: vec![expected_file("peer\\A\\one.flac", "one.flac", 10)],
+            }],
+        };
+
+        let outcome = poll(&client, &token, "slskd-downloads", present(&[])).ok();
+
+        assert!(matches!(outcome, Some(Polled::Lost)));
+        assert_eq!(
+            fake.calls()
+                .into_iter()
+                .filter(|call| call.starts_with("DELETE"))
+                .collect::<Vec<String>>(),
+            vec!["DELETE /api/v0/transfers/downloads/peer_free/t9?remove=true".to_string()]
+        );
+    }
+
+    /// Builds a client whose one batch reports a completed transfer.
+    fn completed_batch() -> api::Client<Fake> {
+        let fake = Fake::new(&[
+            (
+                "GET /api/v0/transfers/downloads/batches/",
+                200,
+                r#"{"transfers":[{"id":"t1","filename":"peer\\A\\CD1\\01 - x.flac","state":"Completed, Succeeded"}]}"#,
+            ),
+            ("DELETE /api/v0/transfers/downloads/", 204, ""),
+        ]);
+
+        api::Client::with_transport(BASE, "key", fake)
+    }
+
+    /// Builds the download of [`completed_batch`].
+    fn completed_download() -> tokens::DownloadToken {
+        tokens::DownloadToken {
+            key: "0f8b".to_string(),
+            username: "peer_free".to_string(),
+            batches: vec![tokens::BatchRef {
+                id: "b1".to_string(),
+                files: vec![expected_file(
+                    "peer\\A\\CD1\\01 - x.flac",
+                    "CD1/01 - x.flac",
+                    10,
+                )],
+            }],
+        }
+    }
+
+    #[test]
+    fn accepts_a_completed_file_of_a_flattened_batch() {
+        let client = completed_batch();
+
+        let outcome = poll(
+            &client,
+            &completed_download(),
+            "slskd-downloads",
+            present(&[("hearthsound/0f8b/01 - x.flac", 10)]),
+        )
+        .ok();
+
+        let Some(Polled::Complete(files)) = outcome else {
+            panic!("expected a completed download");
+        };
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "hearthsound/0f8b/01 - x.flac");
+    }
+
+    #[test]
+    fn accepts_a_completed_file_of_a_nested_batch() {
+        let client = completed_batch();
+
+        let outcome = poll(
+            &client,
+            &completed_download(),
+            "slskd-downloads",
+            present(&[("hearthsound/0f8b/CD1/01 - x.flac", 10)]),
+        )
+        .ok();
+
+        let Some(Polled::Complete(files)) = outcome else {
+            panic!("expected a completed download");
+        };
+
+        assert_eq!(files[0].path, "hearthsound/0f8b/CD1/01 - x.flac");
+    }
+
+    #[test]
+    fn keeps_waiting_for_a_file_that_is_not_at_a_path_yet() {
+        let client = completed_batch();
+
+        let outcome = poll(
+            &client,
+            &completed_download(),
+            "slskd-downloads",
+            present(&[("hearthsound/0f8b/CD1/01 - x.flac", 9)]),
+        )
+        .ok();
+
+        assert!(matches!(
+            outcome,
+            Some(Polled::State(DownloadState::Running(_)))
         ));
     }
 }

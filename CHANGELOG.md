@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Failed downloads leave nothing behind: a batch that slskd partly refuses is
+  cancelled before the error, and a later batch that fails cancels the batches
+  already enqueued, so no file keeps downloading without a token the server can
+  cancel.
+- A completed download is accepted at either path slskd can write it to, the
+  batch's flattened name or the file's remote subfolder, and the plugin reports
+  the path it found.
+
+### Changed
+
+- A download with at least one file moving is reported as `running` even when
+  other files of the candidate still wait in a peer's queue, so the server
+  applies the stall timeout to a download that is making progress instead of the
+  queue timeout.
+- A download whose batches slskd no longer knows and whose files are not at
+  their paths is cancelled and reported as `failed`, instead of not-found: the
+  failure no longer leaves the download's sibling batches running.
+- Finished transfers are cleared from slskd with `?remove=false`, so a file the
+  host has not imported yet cannot be deleted; a cancelled download is cleared
+  with `?remove=true`, which deletes only the files under the plugin's own
+  destination directory.
+- `cancel-download` logs why it cannot reach the instance instead of returning
+  silently.
 ## [0.2.0] - 2026-10-23
 
 ### Added

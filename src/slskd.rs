@@ -143,8 +143,10 @@ pub struct BatchFile {
 pub struct BatchOptions {
     /// Destination directory, relative to slskd's downloads directory.
     ///
-    /// slskd uses this verbatim, without expanding its own destination tokens,
-    /// and flattens every file of the batch to its file name under it.
+    /// slskd uses this verbatim, without expanding its own destination tokens.
+    /// Whether it flattens every file of the batch to its file name under it or
+    /// keeps the remote subfolders is not settled, so the plugin checks both
+    /// layouts ([`crate::download`]).
     pub destination: String,
 }
 

@@ -1,11 +1,14 @@
 //! The remote files of one download: how they are grouped into batches, and
 //! where they land under the import root.
 //!
-//! slskd's batch API takes the files of one batch, downloads them into one
-//! destination directory and flattens them to their file names, so a batch has
-//! to hold the files of a single remote directory and the pinned path of a
-//! downloaded file is its destination plus its name. That is what makes a
-//! download verifiable: the plugin knows where each file has to appear, and the
+//! slskd's batch API takes the files of one batch and downloads them into one
+//! destination directory. Whether it keeps a file's remote subfolder under that
+//! directory or flattens it to its file name is not documented by the instance
+//! the plugin talks to, so a batch still holds the files of a single remote
+//! directory and the plugin accepts either layout: the path of a downloaded file
+//! is its destination plus either its name or its path relative to the batch's
+//! directory, and the completion check looks for both. That is what makes a
+//! download verifiable: the plugin knows where each file can appear, and the
 //! server can hand the file on without asking slskd anything.
 //!
 //! Everything here is pure: it never touches the network, so it is unit-tested
@@ -47,7 +50,9 @@ pub fn destination(key: &str) -> String {
 /// # Parameters
 ///
 /// - `key`: the download's random key.
-/// - `name`: the file's name, which is its remote basename.
+/// - `name`: the file's name or the file's path relative to its batch's
+///   directory, which is what [`tokens::ExpectedFile`] carries as `name` and as
+///   `relative`.
 ///
 /// # Returns
 ///
@@ -57,6 +62,7 @@ pub fn destination(key: &str) -> String {
 ///
 /// ```text
 /// pinned_path("0f8b", "01 Song.flac") -> "hearthsound/0f8b/01 Song.flac"
+/// pinned_path("0f8b", "CD1/01 Song.flac") -> "hearthsound/0f8b/CD1/01 Song.flac"
 /// ```
 pub fn pinned_path(key: &str, name: &str) -> String {
     format!("{}/{}", destination(key), name)
@@ -149,21 +155,58 @@ pub fn group_by_directory(files: &[tokens::RemoteFile]) -> Vec<Group> {
 ///
 /// # Parameters
 ///
+/// - `directory`: the remote directory the batch's files are served from, as
+///   [`Group::directory`] names it.
 /// - `files`: the remote files of one batch.
 ///
 /// # Returns
 ///
-/// One entry per file, holding its remote path, the name it lands under and its
-/// size.
-pub fn expected(files: &[tokens::RemoteFile]) -> Vec<tokens::ExpectedFile> {
+/// One entry per file, holding its remote path, the name it lands under when
+/// slskd flattens the batch, the path it lands under when slskd keeps the
+/// remote subfolder, and its size.
+pub fn expected(directory: &str, files: &[tokens::RemoteFile]) -> Vec<tokens::ExpectedFile> {
     files
         .iter()
         .map(|file| tokens::ExpectedFile {
             filename: file.filename.clone(),
             name: slskd::basename(&file.filename).to_string(),
+            relative: relative(directory, &file.filename),
             size: file.size,
         })
         .collect()
+}
+
+/// Returns a remote path relative to the directory it is served from.
+///
+/// # Parameters
+///
+/// - `directory`: the remote directory, with the peer's own separators.
+/// - `filename`: the remote path of the file.
+///
+/// # Returns
+///
+/// Everything after the directory and its separator, with the peer's
+/// separators turned into `/`, which is what a path under an import root uses.
+/// A path that does not start with the directory is returned whole, so the
+/// completion check still looks at the file's own name.
+///
+/// # Example
+///
+/// ```text
+/// relative("@@tqkz\\Music\\Album", "@@tqkz\\Music\\Album\\CD1\\01 Song.flac")
+///     -> "CD1/01 Song.flac"
+/// relative("@@tqkz\\Music\\Album", "@@tqkz\\Music\\Album\\01 Song.flac")
+///     -> "01 Song.flac"
+/// ```
+fn relative(directory: &str, filename: &str) -> String {
+    let rest = filename.strip_prefix(directory).unwrap_or(filename);
+    let rest = rest.trim_start_matches(['\\', '/']);
+
+    if rest.is_empty() {
+        return slskd::basename(filename).to_string();
+    }
+
+    rest.replace('\\', "/")
 }
 
 #[cfg(test)]
@@ -234,15 +277,44 @@ mod tests {
 
     #[test]
     fn expects_the_basename_and_size_of_every_file() {
-        let expected = expected(&[file("@@tqkz\\Music\\Album\\01 Song.flac", 4_841)]);
+        let expected = expected(
+            "@@tqkz\\Music\\Album",
+            &[file("@@tqkz\\Music\\Album\\01 Song.flac", 4_841)],
+        );
 
         assert_eq!(
             expected,
             vec![tokens::ExpectedFile {
                 filename: "@@tqkz\\Music\\Album\\01 Song.flac".to_string(),
                 name: "01 Song.flac".to_string(),
+                relative: "01 Song.flac".to_string(),
                 size: 4_841,
             }]
         );
+    }
+
+    #[test]
+    fn expects_the_path_of_a_file_in_a_remote_subfolder() {
+        let expected = expected(
+            "@@tqkz\\Music\\Album",
+            &[file("@@tqkz\\Music\\Album\\CD1\\01 - x.flac", 4_841)],
+        );
+
+        assert_eq!(
+            expected,
+            vec![tokens::ExpectedFile {
+                filename: "@@tqkz\\Music\\Album\\CD1\\01 - x.flac".to_string(),
+                name: "01 - x.flac".to_string(),
+                relative: "CD1/01 - x.flac".to_string(),
+                size: 4_841,
+            }]
+        );
+    }
+
+    #[test]
+    fn keeps_a_path_that_a_group_directory_does_not_prefix() {
+        assert_eq!(relative("A", "B\\one.flac"), "B/one.flac");
+        assert_eq!(relative("", "one.flac"), "one.flac");
+        assert_eq!(relative("A", "A"), "A");
     }
 }

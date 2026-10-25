@@ -84,8 +84,18 @@ pub struct ExpectedFile {
     /// Remote path, exactly as the peer reported it, which is what slskd's
     /// transfer records carry.
     pub filename: String,
-    /// Name the file lands under, which is its remote file name.
+    /// Name the file lands under when slskd flattens its batch, which is its
+    /// remote file name.
     pub name: String,
+    /// Path the file lands under when slskd keeps the remote subfolder, which
+    /// is its remote path relative to its batch's directory, with `/` between
+    /// the components. It equals `name` for a file of the batch's own
+    /// directory, and the completion check accepts either path.
+    ///
+    /// A token written before this field existed decodes with an empty value,
+    /// which leaves the flattened path as the only one checked.
+    #[serde(default)]
+    pub relative: String,
     /// Expected size in bytes.
     pub size: u64,
 }
@@ -217,6 +227,7 @@ mod tests {
                 files: vec![ExpectedFile {
                     filename: "@@tqkz\\Music\\01 Windowlicker.flac".to_string(),
                     name: "01 Windowlicker.flac".to_string(),
+                    relative: "01 Windowlicker.flac".to_string(),
                     size: 48_410_233,
                 }],
             }],
@@ -236,6 +247,15 @@ mod tests {
             "01 Windowlicker.flac"
         );
         assert_eq!(decode::<DownloadToken>(&encoded).unwrap(), token);
+    }
+
+    #[test]
+    fn decodes_a_download_token_from_before_the_relative_path() {
+        let json = r#"{"key":"k","username":"peer","batches":[{"id":"b","files":[{"filename":"a.flac","name":"a.flac","size":1}]}]}"#;
+        let token = decode::<DownloadToken>(&URL_SAFE_NO_PAD.encode(json)).unwrap();
+
+        assert_eq!(token.batches[0].files[0].relative, "");
+        assert_eq!(token.batches[0].files[0].name, "a.flac");
     }
 
     #[test]

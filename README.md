@@ -123,17 +123,25 @@ requests, and the server already bounds how many searches run at once.
   files, so a candidate survives the server recycling a plugin instance.
 - `start-download` enqueues one batch per remote directory with
   `options.destination = "hearthsound/<key>"`, where `<key>` is a random,
-  filesystem-safe key. slskd flattens a batch's files to their basenames under
-  that destination, and its `externalId` option is accepted but never stored, so
-  the destination path is what correlates a download with its files.
+  filesystem-safe key. Whether slskd flattens a batch's files to their names
+  under that destination or keeps their remote subfolders is not documented, so
+  the plugin accepts either layout. Its `externalId` option is accepted but
+  never stored, so the destination path is what correlates a download with its
+  files. A batch that slskd partly refuses is cancelled before the error, and a
+  later batch that fails cancels the batches already enqueued, so nothing keeps
+  downloading without a token.
 - `poll-download` reports `complete` only when slskd reports every enqueued file
-  as `Completed, Succeeded` and each file is present at its pinned path with the
-  expected size. slskd can report a transfer as complete while the file is still
-  in its `incomplete` directory. If a batch is gone from slskd, the plugin
-  completes the download when every file is present at its pinned path, and
-  otherwise reports not-found so the server restarts the search.
-- Finished transfers are cleared from slskd with a record-only delete
-  (`?remove=true`), which leaves the files on disk untouched.
+  as `Completed, Succeeded` and each file is present at one of its two possible
+  paths with the expected size. slskd can report a transfer as complete while
+  the file is still in its `incomplete` directory. If a batch is gone from
+  slskd, the plugin completes the download when every file is present, and
+  otherwise cancels the download's transfers and reports `failed`. A download
+  with at least one file moving is `running`, even when other files still wait
+  in a peer's queue.
+- Finished transfers are cleared from slskd with `?remove=false`, which leaves
+  the files on disk for the host to import. A cancelled download is cleared with
+  `?remove=true`, which also deletes the partial files under the plugin's own
+  destination directory.
 - slskd's own error statuses map to provider errors: `401` and `403` to
   unauthorized, `429` to rate-limited (or unavailable on the batch route, which
   throttles instead of retrying), a `404` that means an unknown search or batch

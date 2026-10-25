@@ -117,11 +117,16 @@ pub struct Progress {
 }
 
 /// What the observed transfers of a download mean.
+///
+/// A download with at least one file moving is running; the queue timeout only
+/// applies when nothing moves, which is why [`Assessment::Running`] wins over
+/// [`Assessment::Queued`] as soon as any file of the candidate is transferring.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Assessment {
     /// A transfer failed; the message is slskd's exception text.
     Failed(String),
-    /// The download is waiting, with the shortest queue position slskd knows.
+    /// Nothing moves and at least one file waits in a peer's queue, with the
+    /// shortest queue position slskd knows.
     Queued(Option<u32>),
     /// The download is moving.
     Running(Progress),
@@ -137,6 +142,9 @@ pub enum Assessment {
 
 /// Assesses a download from the transfers slskd reported.
 ///
+/// A download with at least one file moving is running; the queue timeout only
+/// applies when nothing moves.
+///
 /// # Parameters
 ///
 /// - `expected`: the files the download is expected to produce.
@@ -147,10 +155,11 @@ pub enum Assessment {
 /// # Returns
 ///
 /// The [`Assessment`]: a failure as soon as one transfer failed, then whether
-/// every file succeeded, then whether the download is waiting in a queue, and
-/// otherwise how far it has moved.
+/// every file succeeded, then whether the download is moving, then whether it
+/// is waiting in a queue, and otherwise how far it has moved.
 pub fn assess(expected: &[tokens::ExpectedFile], observed: &[Observed]) -> Assessment {
     let mut succeeded = 0;
+    let mut running = false;
     let mut queued = false;
     let mut place_in_queue: Option<u32> = None;
     let mut unaccounted = false;
@@ -176,7 +185,7 @@ pub fn assess(expected: &[tokens::ExpectedFile], observed: &[Observed]) -> Asses
                         Some(place_in_queue.map_or(place, |current| current.min(place)));
                 }
             }
-            Class::Running => {}
+            Class::Running => running = true,
         }
     }
 
@@ -188,6 +197,10 @@ pub fn assess(expected: &[tokens::ExpectedFile], observed: &[Observed]) -> Asses
 
     if succeeded == expected.len() {
         return Assessment::AwaitingFiles(progress);
+    }
+
+    if running {
+        return Assessment::Running(progress);
     }
 
     if queued {
@@ -271,8 +284,44 @@ mod tests {
         tokens::ExpectedFile {
             filename: filename.to_string(),
             name: slskd::basename(filename).to_string(),
+            relative: slskd::basename(filename).to_string(),
             size,
         }
+    }
+
+    #[test]
+    fn a_moving_file_wins_over_a_queued_one() {
+        let mut queued = observed("b.flac", "Queued, Remotely");
+        queued.place_in_queue = Some(2);
+        let mut running = observed("a.flac", "InProgress");
+        running.bytes_transferred = 40;
+        running.average_speed_bps = 900.0;
+
+        let assessment = assess(
+            &[expected("a.flac", 100), expected("b.flac", 60)],
+            &[queued, running],
+        );
+
+        assert_eq!(
+            assessment,
+            Assessment::Running(Progress {
+                bytes: 40,
+                total_bytes: 160,
+                speed_bps: 900,
+            })
+        );
+    }
+
+    #[test]
+    fn a_queued_pair_reports_the_queue() {
+        let observed = vec![
+            observed("a.flac", "Queued, Remotely"),
+            observed("b.flac", "Queued, Locally"),
+        ];
+
+        let assessment = assess(&[expected("a.flac", 1), expected("b.flac", 2)], &observed);
+
+        assert_eq!(assessment, Assessment::Queued(None));
     }
 
     #[test]
